@@ -30,7 +30,7 @@ if st.session_state.running:
     }
     st.session_state.history.loc[len(st.session_state.history)] = new_row
     time.sleep(1)
-    st.experimental_rerun()
+   st.rerun()
 
 df = st.session_state.history
 
@@ -42,3 +42,4 @@ if not df.empty:
     right.line_chart(df.set_index("Time")["SpO2"])
 else:
     st.info("Click Start to begin streaming.")
+
