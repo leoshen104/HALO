@@ -12,11 +12,6 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# === ML imports (lightweight) ===
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
 
 # -------------------- Page / Branding --------------------
 st.set_page_config(page_title="HALO v3.4", page_icon="🛡️", layout="wide")
