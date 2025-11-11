@@ -300,7 +300,6 @@ def generate_synthetic_df(n_bleed=800, n_bronch=800, n_vaso=800, n_pain=800, n_n
     data += _sample_class("Normal", n_normal)
     df = pd.DataFrame(data)
     return df.sample(frac=1.0, random_state=42).reset_index(drop=True)
-
 # -------------------- ML Training Lab (UI) --------------------
 st.markdown("### Training Lab (optional)")
 lab1, lab2, lab3, lab4 = st.columns([2,2,2,2])
@@ -333,13 +332,31 @@ with lab2:
             st.error(f"Failed to read labeled CSV: {e}")
 
 with lab3:
-    # NOTE: Keeping button placeholder; actual training requires scikit-learn imports.
-    # If you plan to train locally, we can re-add sklearn imports and pip install.
-    st.info("Training disabled in this minimal build (no sklearn). Use synthetic means for scenario targets.")
+    if st.button("Train ML model"):
+        df_train = st.session_state.ml_training_df.copy()
+        if df_train.empty:
+            st.warning("No training data yet. Generate synthetic or upload labeled CSV.")
+        else:
+            X = df_train[["HR","SpO2","MAP","EtCO2","RR"]].values
+            y = df_train["label"].values
+            X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=7, stratify=y)
+            scaler = StandardScaler()
+            X_tr_s = scaler.fit_transform(X_tr)
+            X_te_s = scaler.transform(X_te)
+            clf = LogisticRegression(max_iter=1000, multi_class="auto")
+            clf.fit(X_tr_s, y_tr)
+            pred = clf.predict(X_te_s)
+            acc = accuracy_score(y_te, pred)
+            st.session_state.ml_model = clf
+            st.session_state.ml_scaler = scaler
+            st.session_state.ml_classes = list(sorted(np.unique(y)))
+            st.success(f"Model trained. Validation accuracy: {acc:.3f}")
+            st.caption("Simple Logistic Regression over 5 vitals. Swap classifier if desired.")
 
 with lab4:
     st.session_state.ml_use_in_hypothesis = st.checkbox("Use ML in hypothesis", value=st.session_state.ml_use_in_hypothesis)
     st.session_state.ml_drive_scenarios   = st.checkbox("Use ML to drive scenario targets", value=st.session_state.ml_drive_scenarios)
+
 
 # -------------------- Simulation / Replay --------------------
 def _step(val, target, sigma, lo, hi):
