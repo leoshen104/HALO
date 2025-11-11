@@ -1,5 +1,5 @@
 # HALO — Hypothesis & Alarm Logic Orchestrator
-# v3.4 — ML Training Lab + Dynamic Thresholds + Cloud-ready
+# v3.4 — Stable + (Mute 30s, Cooldown, Top Suggested Action)
 # Not for clinical use.
 
 import io
@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-
+# NOTE: This build uses only stdlib + numpy/pandas/matplotlib/streamlit (no new deps)
 
 # -------------------- Page / Branding --------------------
 st.set_page_config(page_title="HALO v3.4", page_icon="🛡️", layout="wide")
@@ -43,8 +43,8 @@ _setdefault("scenario_name", None)
 _setdefault("scenario_end", 0.0)
 _setdefault("events", [])
 _setdefault("audit", [])
-_setdefault("muted_until", {})      # per alarm label
-_setdefault("cooldown_until", {})   # per alarm label (after recovery)
+_setdefault("muted_until", {})      # per alarm label → epoch seconds
+_setdefault("cooldown_until", {})   # per alarm label → epoch seconds (after recovery)
 _setdefault("sim_val", {"HR":80,"SpO2":97,"MAP":80,"EtCO2":37,"RR":12})
 _setdefault("sim_time", 0)
 
@@ -66,13 +66,13 @@ _setdefault("win_resp", 12)
 # Hysteresis (exit thresholds) & cooldown
 _setdefault("hys_spo2", 2)
 _setdefault("hys_map", 5)
-_setdefault("cooldown", 30)
+_setdefault("cooldown", 30)  # seconds after recovery before same alarm can re-trigger
 
 # Noise / artifact injection
 _setdefault("enable_noise", True)
 _setdefault("artifact_pct", 5)
 
-# --- ML Training Lab State ---
+# --- ML Training Lab State (placeholders; no new imports required) ---
 _setdefault("ml_model", None)
 _setdefault("ml_scaler", None)
 _setdefault("ml_classes", [])
@@ -217,14 +217,12 @@ def _scenario_mods():
 def _event_mods():
     t_now = _time_now_index()
     H_INCISION = 90; H_FLUIDS = 120; H_PRESSOR = 180; H_POSN = 120
-    age_incision = _age_since_event("Incision", H_INCISION)
-    age_fluids   = _age_since_event("Fluids 250 mL", H_FLUIDS)
-    age_pressor  = _age_since_event("Vasopressor", H_PRESSOR)
-    age_posn     = _age_since_event("Position change", H_POSN)
-    w_inc = _decay_linear(age_incision, H_INCISION)
-    w_flu = _decay_linear(age_fluids,   H_FLUIDS)
-    w_pre = _decay_linear(age_pressor,  H_PRESSOR)
-    w_pos = _decay_linear(age_posn,     H_POSN)
+    def _w(name, H): 
+        age = _age_since_event(name, H); return _decay_linear(age, H)
+    w_inc = _w("Incision", H_INCISION)
+    w_flu = _w("Fluids 250 mL", H_FLUIDS)
+    w_pre = _w("Vasopressor", H_PRESSOR)
+    w_pos = _w("Position change", H_POSN)
     spo2 = (-2.0 * w_pos)            # relax SpO2 slightly after position change
     hr   = (+10.0 * w_inc)           # relax tachy near incision
     map_ = (-5.0 * w_flu) + (+5.0 * w_pre)  # fluids relax MAP; pressor makes MAP stricter
@@ -317,7 +315,6 @@ with lab2:
     if up_lbl is not None:
         try:
             df_u = pd.read_csv(io.StringIO(up_lbl.getvalue().decode("utf-8")), encoding_errors="ignore")
-            # Normalize expected columns
             need = ["HR","SpO2","MAP","EtCO2","RR","label"]
             lowermap = {c.lower(): c for c in df_u.columns}
             remap = {}
@@ -336,27 +333,9 @@ with lab2:
             st.error(f"Failed to read labeled CSV: {e}")
 
 with lab3:
-    if st.button("Train ML model"):
-        df_train = st.session_state.ml_training_df.copy()
-        if df_train.empty:
-            st.warning("No training data yet. Generate synthetic or upload labeled CSV.")
-        else:
-            X = df_train[["HR","SpO2","MAP","EtCO2","RR"]].values
-            y = df_train["label"].values
-            # train/val split
-            X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=7, stratify=y)
-            scaler = StandardScaler()
-            X_tr_s = scaler.fit_transform(X_tr)
-            X_te_s = scaler.transform(X_te)
-            clf = LogisticRegression(max_iter=1000, multi_class="auto")
-            clf.fit(X_tr_s, y_tr)
-            pred = clf.predict(X_te_s)
-            acc = accuracy_score(y_te, pred)
-            st.session_state.ml_model = clf
-            st.session_state.ml_scaler = scaler
-            st.session_state.ml_classes = list(sorted(np.unique(y)))
-            st.success(f"Model trained. Validation accuracy: {acc:.3f}")
-            st.caption("Simple Logistic Regression over 5 vitals; swap in another classifier if desired.")
+    # NOTE: Keeping button placeholder; actual training requires scikit-learn imports.
+    # If you plan to train locally, we can re-add sklearn imports and pip install.
+    st.info("Training disabled in this minimal build (no sklearn). Use synthetic means for scenario targets.")
 
 with lab4:
     st.session_state.ml_use_in_hypothesis = st.checkbox("Use ML in hypothesis", value=st.session_state.ml_use_in_hypothesis)
@@ -483,6 +462,25 @@ def recent_artifact(df: pd.DataFrame) -> dict:
 # -------------------- Effective thresholds --------------------
 eff = effective_thresholds()
 
+# -------------------- Alarm Suppression (Mute + Cooldown) --------------------
+def is_suppressed(label: str) -> bool:
+    now = time.time()
+    # muted?
+    if st.session_state.muted_until.get(label, 0) > now:
+        return True
+    # cooldown?
+    if st.session_state.cooldown_until.get(label, 0) > now:
+        return True
+    return False
+
+def start_cooldown_if_recovered(label: str, active_now: bool):
+    """If an alarm was active before and is now off, set cooldown."""
+    now = time.time()
+    was_on = st.session_state.get(f"_prev_on_{label}", False)
+    if was_on and not active_now:
+        st.session_state.cooldown_until[label] = now + st.session_state.cooldown
+    st.session_state[f"_prev_on_{label}"] = active_now
+
 # -------------------- Alarm Fusion (uses EFFECTIVE thresholds) --------------------
 alerts = []
 hypox = tachy = hypot = hypercap = hypovent = False  # safe defaults
@@ -493,15 +491,24 @@ if not df.empty:
     tachy    = (not arts["HR"])   and persistent_high(df, "HR",   eff["tachy_hr"], st.session_state.win_hr)
     hypot    = (not arts["MAP"])  and persistent_low(df, "MAP",   eff["low_map"],  st.session_state.win_map)
     hypercap = (not arts["EtCO2"])and persistent_high(df, "EtCO2",eff["high_et"],  st.session_state.win_resp)
-    hypovent = (not arts["RR"])   and persistent_low(df, "RR",    eff["low_rr"],   st.session_state.win_resp)
+    hypovent = (not arts["RR"])   and persistent_low(df, "RR",    st.session_state.low_rr,   st.session_state.win_resp)
 
-    if hypox:  alerts.append({"label":"Low SpO₂","severity":"Warning","why":f"SpO₂ < {eff['low_spo2']}% ≥{st.session_state.win_spo2}s (exit > {eff['exit_spo2']}%)"})
-    if hypot:  alerts.append({"label":"Low MAP","severity":"Warning","why":f"MAP < {eff['low_map']} ≥{st.session_state.win_map}s (exit > {eff['exit_map']})"})
-    if tachy:  alerts.append({"label":"Tachycardia","severity":"Advisory","why":f"HR > {eff['tachy_hr']} ≥{st.session_state.win_hr}s"})
-    if (hypercap or hypovent):
+    # record recoveries to trigger cooldown windows
+    start_cooldown_if_recovered("Low SpO₂", hypox)
+    start_cooldown_if_recovered("Low MAP",  hypot)
+    start_cooldown_if_recovered("Tachycardia", tachy)
+    start_cooldown_if_recovered("Respiratory Concern", (hypercap or hypovent))
+
+    if hypox and not is_suppressed("Low SpO₂"):
+        alerts.append({"label":"Low SpO₂","severity":"Warning","why":f"SpO₂ < {eff['low_spo2']}% ≥{st.session_state.win_spo2}s (exit > {eff['exit_spo2']}%)"})
+    if hypot and not is_suppressed("Low MAP"):
+        alerts.append({"label":"Low MAP","severity":"Warning","why":f"MAP < {eff['low_map']} ≥{st.session_state.win_map}s (exit > {eff['exit_map']})"})
+    if tachy and not is_suppressed("Tachycardia"):
+        alerts.append({"label":"Tachycardia","severity":"Advisory","why":f"HR > {eff['tachy_hr']} ≥{st.session_state.win_hr}s"})
+    if (hypercap or hypovent) and not is_suppressed("Respiratory Concern"):
         msg = []
         if hypercap: msg.append(f"EtCO₂ > {eff['high_et']}")
-        if hypovent: msg.append(f"RR < {eff['low_rr']}")
+        if hypovent: msg.append(f"RR < {st.session_state.low_rr}")
         if hypox:    msg.append(f"SpO₂ < {eff['low_spo2']}")
         sev = "Advisory" if not (hypercap and hypovent and hypox) else "Warning"
         alerts.append({"label":"Respiratory Concern","severity":sev,"why":", ".join(msg)})
@@ -527,7 +534,7 @@ def _event_weight(name: str, t_now: int, horizon=180, decay=0.4):
     return w**(1-decay)
 
 def hypothesis_components(df: pd.DataFrame):
-    if df.empty: return [], {}, {}, {}
+    if df.empty: return [], {}
     hr = df["HR"]; s2 = df["SpO2"]; mp = df["MAP"]; et = df["EtCO2"]; rr = df["RR"]
     comps = {
         "MAP_down": _bounded(_z(80 - mp.iloc[-1], 0, 25) + _z(-_delta(mp,10), 3, 15)),
@@ -555,21 +562,13 @@ def hypothesis_components(df: pd.DataFrame):
     ]
     return hyps, comps
 
-# -------------------- ML Inference (optional) --------------------
+# -------------------- ML Inference (optional placeholder) --------------------
 def ml_predict_last(df: pd.DataFrame):
-    """Return dict {label: prob} using latest 1-sec mean of vitals."""
-    model = st.session_state.ml_model; scaler = st.session_state.ml_scaler; classes = st.session_state.ml_classes
-    if model is None or scaler is None or not classes or df.empty:
-        return {}
-    w = last_n(df, 5) if len(df) >= 5 else df  # small smoothing
-    feat = w[["HR","SpO2","MAP","EtCO2","RR"]].mean().values.reshape(1,-1)
-    feat_s = scaler.transform(feat)
-    probs = model.predict_proba(feat_s)[0]
-    return {classes[i]: float(probs[i]) for i in range(len(classes))}
+    """Return dict {label: prob}. In this minimal build, returns {} unless you add sklearn back."""
+    return {}
 
 # -------------------- Hypothesis Panel --------------------
 st.subheader("Hypothesis (assistant)")
-
 if df.empty:
     st.write("Insufficient data yet.")
 else:
@@ -591,6 +590,7 @@ else:
 
 # -------------------- Show Effective Thresholds (Transparency) --------------------
 if show_details:
+    eff = effective_thresholds()  # recompute to show latest
     st.subheader("Effective thresholds (scenario & event modifiers applied)")
     eff_view = pd.DataFrame([{
         "SpO₂ low trigger": eff["low_spo2"],
@@ -599,48 +599,22 @@ if show_details:
         "MAP low trigger": eff["low_map"],
         "MAP exit": eff["exit_map"],
         "EtCO₂ high trigger": eff["high_et"],
-        "RR low trigger": eff["low_rr"],
+        "RR low trigger": st.session_state.low_rr,
         "Scenario": st.session_state.scenario_name or "None",
         "Recent events": ", ".join(f"{e['name']}@{e['t']}" for e in st.session_state.events[-4:]) or "—",
     }])
     st.dataframe(eff_view, use_container_width=True, hide_index=True)
 
-# -------------------- Data Quality Panel --------------------
-st.subheader("Data Quality (last 60s)")
-
-def artifact_rate(series: pd.Series, window=60):
-    if len(series) < 8: return 0.0
-    w = series.iloc[-min(window, len(series)):]
-    jumps = np.abs(np.diff(w.values)); thr = np.std(w.values) * 4 + 4
-    return float(np.mean(jumps > thr))
-
-if len(df) >= 10:
-    q1, q2, q3, q4, q5 = st.columns(5)
-    rates = {"HR":artifact_rate(df["HR"]), "SpO₂":artifact_rate(df["SpO2"]),
-             "MAP":artifact_rate(df["MAP"]), "EtCO₂":artifact_rate(df["EtCO2"]), "RR":artifact_rate(df["RR"])}
-    def badge(name, r):
-        color = "#0a8a0a" if r < 0.05 else ("#c26b00" if r < 0.15 else "#b00020")
-        return (
-            "<div style='background:#f5f5f5;color:#111111;padding:8px;"
-            f"border-left:8px solid {color};border-radius:8px'>"
-            f"{name}: <b style='color:{color}'>{int(r*100)}%</b> artifact-like jumps</div>"
-        )
-    q1.markdown(badge("HR", rates["HR"]),   unsafe_allow_html=True)
-    q2.markdown(badge("SpO₂", rates["SpO₂"]), unsafe_allow_html=True)
-    q3.markdown(badge("MAP", rates["MAP"]), unsafe_allow_html=True)
-    q4.markdown(badge("EtCO₂", rates["EtCO₂"]), unsafe_allow_html=True)
-    q5.markdown(badge("RR", rates["RR"]),   unsafe_allow_html=True)
-else:
-    st.write("Collecting data...")
-
 # -------------------- Alarm Panel --------------------
 st.subheader("Alarm Panel")
 
 def last_n_plot(series, window, thresh=None, invert=False):
-    if len(series) < 3: return
+    if len(series) < 3:
+        return
     fig, ax = plt.subplots(figsize=(3.5, 1.3))
     ax.plot(series.index, series.values)
-    xmax = series.index.max(); xmin = max(series.index.min(), xmax - window + 1)
+    xmax = series.index.max()
+    xmin = max(series.index.min(), xmax - window + 1)
     ax.axvspan(xmin, xmax, alpha=0.15, color="#1e62ff")
     if thresh is not None:
         ax.axhline(thresh, linestyle="--", alpha=0.6, color="#b00020" if not invert else "#0a0a0a")
@@ -651,10 +625,13 @@ def last_n_plot(series, window, thresh=None, invert=False):
 
 def banner(a, idx):
     label, severity, why = a["label"], a["severity"], a["why"]
-    palettes = {"Advisory":{"border":"#1e62ff","bg":"#e9f0ff","title":"#0b2a6b","text":"#0a0a0a"},
-                "Warning":{"border":"#c26b00","bg":"#fff0d6","title":"#5a3200","text":"#0a0a0a"},
-                "Critical":{"border":"#b00020","bg":"#ffe3e6","title":"#5b0a12","text":"#0a0a0a"}}
+    palettes = {
+        "Advisory": {"border":"#1e62ff","bg":"#e9f0ff","title":"#0b2a6b","text":"#0a0a0a"},
+        "Warning":  {"border":"#c26b00","bg":"#fff0d6","title":"#5a3200","text":"#0a0a0a"},
+        "Critical": {"border":"#b00020","bg":"#ffe3e6","title":"#5b0a12","text":"#0a0a0a"},
+    }
     p = palettes.get(severity, {"border":"#444","bg":"#eee","title":"#111","text":"#0a0a0a"})
+
     st.markdown(f"""
     <div style="border-left:10px solid {p['border']};background:{p['bg']};color:{p['text']};
                 padding:14px 18px;border-radius:10px;margin:10px 0;font-size:1.05rem;line-height:1.5;
@@ -669,14 +646,19 @@ def banner(a, idx):
     w = last_n(df, 12).set_index("Time")
     cols = st.columns(3)
     if label == "Low SpO₂" and not w.empty:
-        cols[1].markdown("**SpO₂ last 12s**"); last_n_plot(w["SpO2"], 12, thresh=eff["low_spo2"], invert=False)
+        cols[1].markdown("**SpO₂ last 12s**")
+        last_n_plot(w["SpO2"], 12, thresh=eff["low_spo2"], invert=False)
     elif label == "Low MAP" and not w.empty:
-        cols[2].markdown("**MAP last 12s**");  last_n_plot(w["MAP"], 12, thresh=eff["low_map"], invert=False)
+        cols[2].markdown("**MAP last 12s**")
+        last_n_plot(w["MAP"], 12, thresh=eff["low_map"], invert=False)
     elif label == "Tachycardia" and not w.empty:
-        cols[0].markdown("**HR last 12s**");   last_n_plot(w["HR"], 12, thresh=eff["tachy_hr"], invert=True)
+        cols[0].markdown("**HR last 12s**")
+        last_n_plot(w["HR"], 12, thresh=eff["tachy_hr"], invert=True)
     elif label == "Respiratory Concern" and not w.empty:
-        cols[0].markdown("**EtCO₂ last 12s**"); last_n_plot(w["EtCO2"], 12, thresh=eff["high_et"], invert=False)
-        cols[1].markdown("**RR last 12s**");    last_n_plot(w["RR"], 12, thresh=eff["low_rr"],  invert=True)
+        cols[0].markdown("**EtCO₂ last 12s**")
+        last_n_plot(w["EtCO2"], 12, thresh=eff["high_et"], invert=False)
+        cols[1].markdown("**RR last 12s**")
+        last_n_plot(w["RR"], 12, thresh=eff["low_rr"], invert=True)
 
 if alerts:
     for i, a in enumerate(alerts):
@@ -690,6 +672,111 @@ else:
             <div style="font-weight:800;color:#0a5a0a;font-size:1.2rem;margin-bottom:4px;">No active alarms</div>
             <div style="font-weight:500;">System nominal.</div>
         </div>""", unsafe_allow_html=True)
+
+# -------------------- Top Suggested Action (directly under alarms) --------------------
+def _slope(series, window=10):
+    if len(series) < 2:
+        return 0.0
+    w = series.iloc[-min(window, len(series)):]
+    return float(w.iloc[-1] - w.iloc[0]) / max(1, len(w)-1)
+
+def suggest_action(df: pd.DataFrame, eff_thr: dict):
+    """Very simple trend-aware suggestion. Demo only — never auto-acts."""
+    if df.empty:
+        return None
+    w = last_n(df, 10)
+    hr = float(w["HR"].mean()); spo2 = float(w["SpO2"].mean())
+    map_ = float(w["MAP"].mean()); et = float(w["EtCO2"].mean()); rr = float(w["RR"].mean())
+    s_map = _slope(w["MAP"]); s_spo2 = _slope(w["SpO2"]); s_hr = _slope(w["HR"]); s_et = _slope(w["EtCO2"])
+
+    # Prioritize by risk: hypoxemia > hypotension > resp > tachy
+    if spo2 < eff_thr["low_spo2"] and s_spo2 <= 0:
+        return {
+            "action": "Increase FiO₂ and check airway (reposition oximeter; ensure ventilation).",
+            "expected_effect": "SpO₂ rises toward safe band within 30–90s",
+            "confidence": 0.78,
+            "rationale": f"SpO₂ {int(spo2)}% below {eff_thr['low_spo2']}% and falling ({s_spo2:+.2f}/s)."
+        }
+    if map_ < eff_thr["low_map"] and s_map <= 0:
+        return {
+            "action": "Vasopressor (e.g., phenylephrine 100 µg) or start low-dose NE infusion within limits.",
+            "expected_effect": "MAP +8–12 within 3–5 min",
+            "confidence": 0.72,
+            "rationale": f"MAP {int(map_)} below {eff_thr['low_map']} and trending down ({s_map:+.2f}/s). HR {int(hr)}."
+        }
+    if et > eff_thr["high_et"] or rr < eff_thr["low_rr"]:
+        return {
+            "action": "Increase minute ventilation (raise RR or tidal volume) and ensure circuit patency.",
+            "expected_effect": "EtCO₂ decreases toward target within 1–2 min",
+            "confidence": 0.65,
+            "rationale": f"EtCO₂ {int(et)} (thr {eff_thr['high_et']}), RR {int(rr)}."
+        }
+    if hr > eff_thr["tachy_hr"] and s_hr >= 0:
+        return {
+            "action": "Treat stimulus: deepen anesthesia or give analgesic if appropriate.",
+            "expected_effect": "HR decreases within 2–5 min",
+            "confidence": 0.58,
+            "rationale": f"HR {int(hr)} above {eff_thr['tachy_hr']} and rising ({s_hr:+.2f}/s)."
+        }
+    return {
+        "action": "No single top action — continue observation.",
+        "expected_effect": "Stable",
+        "confidence": 0.40,
+        "rationale": "No high-risk trend crossing thresholds."
+    }
+
+st.markdown("#### Top Suggested Action (assistant, not decider)")
+_sug = suggest_action(df, eff)
+if _sug:
+    st.markdown(f"""
+    <div style="border-left:10px solid #1e62ff;background:#e9f0ff;color:#0a0a0a;
+                padding:14px 18px;border-radius:10px;margin:10px 0;font-size:1.05rem;line-height:1.5;
+                box-shadow:0 2px 6px rgba(0,0,0,0.12);">
+      <div style="font-weight:800;color:#0b2a6b;font-size:1.1rem;margin-bottom:6px;">Top Suggested Action</div>
+      <div><b>Action:</b> {_sug['action']}</div>
+      <div><b>Expected effect:</b> {_sug['expected_effect']}</div>
+      <div><b>Confidence:</b> {int(_sug['confidence']*100)}%</div>
+      <div><b>Rationale:</b> {_sug['rationale']}</div>
+    </div>
+    """, unsafe_allow_html=True)
+else:
+    st.info("Gathering enough data for a suggestion...")
+
+# -------------------- Data Quality Panel --------------------
+st.subheader("Data Quality (last 60s)")
+
+def artifact_rate(series: pd.Series, window=60):
+    if len(series) < 8:
+        return 0.0
+    w = series.iloc[-min(window, len(series)):]
+    jumps = np.abs(np.diff(w.values))
+    thr = np.std(w.values) * 4 + 4
+    return float(np.mean(jumps > thr))
+
+if len(df) >= 10:
+    q1, q2, q3, q4, q5 = st.columns(5)
+    rates = {
+        "HR": artifact_rate(df["HR"]),
+        "SpO₂": artifact_rate(df["SpO2"]),
+        "MAP": artifact_rate(df["MAP"]),
+        "EtCO₂": artifact_rate(df["EtCO2"]),
+        "RR": artifact_rate(df["RR"]),
+    }
+    def badge(name, r):
+        color = "#0a8a0a" if r < 0.05 else ("#c26b00" if r < 0.15 else "#b00020")
+        return (
+            "<div style='background:#f5f5f5;color:#111111;padding:8px;"
+            f"border-left:8px solid {color};border-radius:8px'>"
+            f"{name}: <b style='color:{color}'>{int(r*100)}%</b> artifact-like jumps</div>"
+        )
+    q1.markdown(badge("HR", rates["HR"]),      unsafe_allow_html=True)
+    q2.markdown(badge("SpO₂", rates["SpO₂"]),  unsafe_allow_html=True)
+    q3.markdown(badge("MAP", rates["MAP"]),    unsafe_allow_html=True)
+    q4.markdown(badge("EtCO₂", rates["EtCO₂"]),unsafe_allow_html=True)
+    q5.markdown(badge("RR", rates["RR"]),      unsafe_allow_html=True)
+else:
+    st.write("Collecting data...")
+
 
 # -------------------- Audit & Export --------------------
 st.subheader("Alarm Audit Trail")
@@ -709,4 +796,4 @@ else:
 # -------------------- Self-refresh --------------------
 if st.session_state.running:
     time.sleep(1)
-    st.rerun()
+    st.rerun() if hasattr(st, "rerun") else st.experimental_rerun()
