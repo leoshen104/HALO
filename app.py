@@ -12,387 +12,250 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 import matplotlib.pyplot as plt
-# -------------------------------
-# Conversational Q&A: answer_query
-# -------------------------------
-def _last_window(df, seconds, sim_hz):
-    if df.empty or sim_hz <= 0:
-        return df
-    n = max(1, min(len(df), int(seconds * sim_hz)))
-    return df.iloc[-n:].copy()
-
-def _slope(series):
-    if len(series) < 2:
-        return 0.0
-    return float(series.iloc[-1] - series.iloc[0])
-
-def _fmt_trend(val, units="", per=""):
-    arrow = "↑" if val > 0 else ("↓" if val < 0 else "→")
-    return f"{arrow} {abs(val):.1f}{units}{per}"
-
-def _safe_corr(a, b):
-    if len(a) < 3 or len(b) < 3:
-        return None
-    try:
-        return float(np.corrcoef(a, b)[0, 1])
-    except Exception:
-        return None
-
-def _scatter_fig(x, y, xlabel, ylabel, title=""):
-    fig, ax = plt.subplots(figsize=(4.5, 2.8))
-    ax.scatter(x, y, s=12, alpha=0.8)
-    # simple least-squares line if enough points
-    if len(x) >= 3:
-        try:
-            coeffs = np.polyfit(x, y, 1)
-            xx = np.linspace(min(x), max(x), 50)
-            yy = coeffs[0] * xx + coeffs[1]
-            ax.plot(xx, yy, linewidth=2)
-        except Exception:
-            pass
-    ax.set_xlabel(xlabel); ax.set_ylabel(ylabel); ax.set_title(title)
-    fig.tight_layout()
-    return fig
-
-def _mini_line_fig(x, y, ylabel, title=""):
-    fig, ax = plt.subplots(figsize=(4.5, 2.0))
-    ax.plot(x, y, linewidth=2)
-    ax.set_ylabel(ylabel); ax.set_xticks([]); ax.set_title(title)
-    fig.tight_layout()
-    return fig
-
-def answer_query(query: str, df: pd.DataFrame, sim_hz: int):
+# ---- Voice feature availability check ----
+def voice_available():
     """
-    Upgraded reasoning: analyzes up to ~90s window with adaptive sensitivity.
-    Returns: {"text": <markdown>, "figs": [(title, fig), ...]}
+    Returns True if required dependencies for voice input are installed.
+    Prevents Streamlit from calling undefined imports.
     """
-    q = (query or "").strip().lower()
-    figs = []
-    if df is None or df.empty:
-        return {
-            "text": "I don’t have enough data yet. Start the stream or load a replay, then ask again.",
-            "figs": figs,
-        }
-
-    # Prefer 90s, then 60s, then 30s for robustness
-    def _pick_window(df_in):
-        for secs in (90, 60, 30):
-            w = _last_window(df_in, secs, max(sim_hz, 1))
-            if len(w) >= max(6, secs // 2):  # enough samples
-                return w, secs
-        w = _last_window(df_in, 15, max(sim_hz, 1))
-        return w if not w.empty else df_in, len(w)
-
-    w, win_secs = _pick_window(df)
-    xidx = w["Time"].values if "Time" in w.columns else np.arange(len(w))
-
-    def slope_per_sample(series):
-        if len(series) < 2:
-            return 0.0
-        x = np.arange(len(series), dtype=float)
-        y = series.to_numpy(dtype=float)
-        xm, ym = x.mean(), y.mean()
-        denom = ((x - xm) ** 2).sum()
-        if denom == 0:
-            return 0.0
-        return float(((x - xm) * (y - ym)).sum() / denom)
-
-    trends = {}
-    for col in ["MAP", "HR", "SpO2", "EtCO2", "RR"]:
-        if col in w.columns:
-            trends[col] = slope_per_sample(w[col])
-    now_vals = {col: (int(w[col].iloc[-1]) if col in w.columns else None)
-                for col in ["MAP", "HR", "SpO2", "EtCO2", "RR"]}
-
-    # Helper summary line
-    def base_summary():
-        parts = []
-        if now_vals["MAP"] is not None:
-            parts.append(f"MAP {now_vals['MAP']} mmHg ({_fmt_trend(trends.get('MAP',0),'','/s over ~'+str(win_secs)+'s')})")
-        if now_vals["HR"] is not None:
-            parts.append(f"HR {now_vals['HR']} bpm ({_fmt_trend(trends.get('HR',0),'','/s over ~'+str(win_secs)+'s')})")
-        if now_vals["SpO2"] is not None:
-            parts.append(f"SpO₂ {now_vals['SpO2']}% ({_fmt_trend(trends.get('SpO2',0),'','/s over ~'+str(win_secs)+'s')})")
-        if now_vals["EtCO2"] is not None:
-            parts.append(f"EtCO₂ {now_vals['EtCO2']} mmHg ({_fmt_trend(trends.get('EtCO2',0),'','/s over ~'+str(win_secs)+'s')})")
-        if now_vals["RR"] is not None:
-            parts.append(f"RR {now_vals['RR']} bpm ({_fmt_trend(trends.get('RR',0),'','/s over ~'+str(win_secs)+'s')})")
-        return " · ".join(parts) if parts else "Signals available but not enough variation to summarize."
-
-    # Simple artifact screen for SpO₂ (abrupt, non-physiologic jumps)
-    s2_artifacty = False
     try:
-        if "SpO2" in w.columns and len(w["SpO2"]) >= 6:
-            recent = w["SpO2"].iloc[-6:].values
-            jumps = np.abs(np.diff(recent))
-            s2_artifacty = bool(len(jumps) and np.percentile(jumps, 90) > (np.std(recent) * 4 + 4))
-    except Exception:
-        pass
-
-    # Pattern reasoning (ranked explanations)
-    explanations = []
-    slope_lo = 0.01 if win_secs >= 60 else 0.005  # adaptive sensitivity
-
-    map_falling = trends.get("MAP", 0.0) < -slope_lo
-    hr_rising   = trends.get("HR", 0.0)  >  slope_lo
-    et_rising   = trends.get("EtCO2",0.0)>  slope_lo
-    rr_stable   = abs(trends.get("RR",0.0)) < slope_lo
-    s2_down     = trends.get("SpO2",0.0)   < -slope_lo
-
-    # Hypoventilation
-    if et_rising and (rr_stable or trends.get("RR",0.0) < -slope_lo):
-        conf = min(0.95, 0.6 + 0.2 * max(0, trends.get("EtCO2",0.0) * 10))
-        explanations.append(("Hypoventilation likely", conf,
-                             f"EtCO₂ rising with RR {'stable' if rr_stable else 'decreasing'} over ~{win_secs}s."))
-
-    # Hypovolemia vs vasodilation
-    if map_falling and hr_rising:
-        explanations.append(("Relative hypovolemia pattern", 0.8,
-                             f"MAP falling with compensatory HR rise over ~{win_secs}s."))
-    if map_falling and not hr_rising:
-        explanations.append(("Vasodilation or anesthetic depth effect", 0.6,
-                             f"MAP falling without sympathetic HR rise over ~{win_secs}s."))
-
-    # SpO2 artifact vs true hypoxemia
-    if s2_artifacty and not hr_rising and not map_falling:
-        explanations.append(("SpO₂ probe/signal artifact likely", 0.6,
-                             "Abrupt SpO₂ jumps without HR/MAP corroboration."))
-
-    # Rank explanations
-    explanations = sorted(explanations, key=lambda x: x[1], reverse=True)
-    if not explanations:
-        explanations = [("Pattern unclear", 0.15, f"No strong multi-signal pattern over ~{win_secs}s.")]
-
-    # Top Suggested Action (text only; your UI card is separate)
-    top = explanations[0][0]
-    if "Hypoventilation" in top:
-        action = "Increase minute ventilation (rate or tidal volume) if appropriate; verify airway patency."
-        why    = "EtCO₂ rising with RR stable/decreasing. Risk of further CO₂ retention if untreated."
-    elif "Relative hypovolemia" in top:
-        action = "Evaluate volume status; consider fluid bolus if volume-responsive; reassess bleeding."
-        why    = "MAP falling with HR rising suggests compensation for decreased effective circulating volume."
-    elif "Vasodilation" in top:
-        action = "Consider reducing anesthetic depth and/or cautious vasopressor per protocol."
-        why    = "MAP falling without HR rise suggests vasodilation/drug effect."
-    elif "SpO₂ probe" in top:
-        action = "Re-seat pulse oximeter; check perfusion and motion; corroborate with waveform."
-        why    = "SpO₂ instability without physiologic corroboration suggests artifact."
-    else:
-        action = "Reassess airway, breathing, circulation; review recent events and alarms."
-        why    = "No single dominant pattern detected."
-
-    # Intent routing
-    text_lines = []
-
-    # Q1: why is MAP falling?
-    if ("why" in q and "map" in q) or ("map" in q and ("fall" in q or "low" in q or "drop" in q)):
-        text_lines.append("**Interpretation:** MAP is falling.")
-        text_lines.append(f"**Likely cause(s):** " + "; ".join([f"{lbl} ({int(c*100)}%): {r}" for (lbl,c,r) in explanations[:3]]))
-        text_lines.append(f"**Top Suggested Action:** {action}. **Rationale:** {why}")
-        text_lines.append(f"**Status:** {base_summary()}")
-        if "MAP" in w.columns:
-            figs.append(("MAP — last ~{}s".format(win_secs), _mini_line_fig(xidx, w["MAP"].values, "MAP (mmHg)", f"MAP — last ~{win_secs}s")))
-        return {"text": "\n\n".join(text_lines), "figs": figs}
-
-    # Q2: SpO₂ vs EtCO₂ correlation
-    if ("spo2" in q and "etco2" in q and ("corr" in q or "relation" in q)):
-        c = _safe_corr(w["SpO2"].values if "SpO2" in w.columns else [], w["EtCO2"].values if "EtCO2" in w.columns else [])
-        if c is None:
-            text_lines.append("Not enough points to compute a stable correlation yet.")
-        else:
-            relation = "negative" if c < -0.2 else ("positive" if c > 0.2 else "weak")
-            text_lines.append(f"**SpO₂–EtCO₂ correlation (last ~{win_secs}s):** r = {c:.2f} ({relation}).")
-            figs.append((
-                f"SpO₂ vs EtCO₂ — last ~{win_secs}s",
-                _scatter_fig(w['SpO2'].values, w['EtCO2'].values, "SpO₂ (%)", "EtCO₂ (mmHg)", f"SpO₂ vs EtCO₂ — last ~{win_secs}s"),
-            ))
-        text_lines.append(f"**Status:** {base_summary()}")
-        return {"text": "\n\n".join(text_lines), "figs": figs}
-
-    # Q3: generic “trends” / “what’s happening now”
-    if "trend" in q or "happening" in q or "summary" in q or q in {"?", "now"}:
-        text_lines.append("**Situation summary (multi-signal, last ~{}s):**".format(win_secs))
-        text_lines.append(base_summary())
-        hints = []
-        if trends.get("MAP", 0) < -0.15 and trends.get("HR", 0) > 0.10:
-            hints.append("Pattern consistent with relative hypovolemia (MAP↓ + HR↑).")
-        if trends.get("EtCO2", 0) > 0.10 and trends.get("RR", 0) < -0.05:
-            hints.append("Pattern consistent with hypoventilation (EtCO₂↑ + RR↓).")
-        if s2_artifacty:
-            hints.append("SpO₂ shows artifact-like jumps; corroborate before acting.")
-        if hints:
-            text_lines.append("**Reasoning hints:** " + " ".join(hints))
-        for col, ylabel in [("MAP","MAP (mmHg)"), ("HR","HR (bpm)"), ("SpO2","SpO₂ (%)"), ("EtCO2","EtCO₂ (mmHg)"), ("RR","RR (bpm)")]:
-            if col in w.columns:
-                figs.append((f"{col} — last ~{win_secs}s", _mini_line_fig(xidx, w[col].values, ylabel, f"{col} — last ~{win_secs}s")))
-        return {"text": "\n\n".join(text_lines), "figs": figs}
-
-    # Default: give ranked causes + top action
-    expl_txt = "; ".join([f"{lbl} ({int(c*100)}%): {r}" for (lbl, c, r) in explanations[:3]])
-    text = (
-        f"{base_summary()}\n\n"
-        f"**Interpreted patterns:** {expl_txt}\n\n"
-        f"**Top Suggested Action:** {action}. **Rationale:** {why}"
-    )
-    return {"text": text, "figs": figs}
-
-    # Use a recent window for responsiveness; expand automatically if needed
-    win_secs = 30
-    w = _last_window(df, win_secs, sim_hz)
-    xidx = w["Time"].values if "Time" in w.columns else np.arange(len(w))
-
-    # Quick trends
-    trends = {}
-    for col in ["MAP", "HR", "SpO2", "EtCO2", "RR"]:
-        if col in w.columns:
-            trends[col] = _slope(w[col])
-    now_vals = {col: (int(w[col].iloc[-1]) if col in w.columns else None)
-                for col in ["MAP", "HR", "SpO2", "EtCO2", "RR"]}
-
-    # Helpers to build narrative
-    def basic_summary():
-        parts = []
-        if now_vals["MAP"] is not None:
-            parts.append(f"MAP {now_vals['MAP']} mmHg ({_fmt_trend(trends.get('MAP',0),'',' over 30s')})")
-        if now_vals["HR"] is not None:
-            parts.append(f"HR {now_vals['HR']} bpm ({_fmt_trend(trends.get('HR',0),'',' over 30s')})")
-        if now_vals["SpO2"] is not None:
-            parts.append(f"SpO₂ {now_vals['SpO2']}% ({_fmt_trend(trends.get('SpO2',0),'',' over 30s')})")
-        if now_vals["EtCO2"] is not None:
-            parts.append(f"EtCO₂ {now_vals['EtCO2']} mmHg ({_fmt_trend(trends.get('EtCO2',0),'',' over 30s')})")
-        if now_vals["RR"] is not None:
-            parts.append(f"RR {now_vals['RR']} bpm ({_fmt_trend(trends.get('RR',0),'',' over 30s')})")
-        return " · ".join(parts) if parts else "Signals available but not enough variation to summarize."
-
-    # Route by intent
-    text_lines = []
-
-    # 1) Why is MAP falling?
-    if ("why" in q and "map" in q) or ("map" in q and "fall" in q):
-        if "MAP" in w.columns:
-            slope = trends.get("MAP", 0.0)
-            hr_slope = trends.get("HR", 0.0)
-            spo2_slope = trends.get("SpO2", 0.0)
-            rationale = []
-            if slope < -1.5:
-                rationale.append("MAP is declining over the last ~30s.")
-            if hr_slope >= 1.0:
-                rationale.append("HR is rising → sympathetic compensation.")
-            if spo2_slope <= -0.5:
-                rationale.append("SpO₂ trending down suggests broader physiologic stress.")
-            if not rationale:
-                rationale.append("Decline is mild/flat; consider depth/drug effects or noise.")
-            text_lines.append("**Interpretation:** MAP is falling.")
-            text_lines.append("**Why:** " + " ".join(rationale))
-            # Add a small trend fig
-            if "MAP" in w.columns:
-                figs.append(("MAP last 30s", _mini_line_fig(xidx, w["MAP"].values, "MAP (mmHg)", "MAP — last 30s")))
-        else:
-            text_lines.append("MAP not available in the current data window.")
-        # Always add a status line
-        text_lines.append(f"**Status:** {basic_summary()}")
-
-    # 2) Show SpO2 vs EtCO2 correlation
-    elif ("spo2" in q and "etco2" in q and "corr" in q) or ("correlat" in q and "spo2" in q):
-        if "SpO2" in w.columns and "EtCO2" in w.columns:
-            c = _safe_corr(w["SpO2"].values, w["EtCO2"].values)
-            if c is None:
-                text_lines.append("Not enough points to compute a stable correlation yet.")
-            else:
-                relation = "negative" if c < -0.2 else ("positive" if c > 0.2 else "weak")
-                text_lines.append(f"**Correlation (last ~30s):** r = {c:.2f} ({relation}).")
-                figs.append((
-                    "SpO₂ vs EtCO₂ (last 30s)",
-                    _scatter_fig(w["SpO2"].values, w["EtCO2"].values, "SpO₂ (%)", "EtCO₂ (mmHg)", "SpO₂ vs EtCO₂ — last 30s"),
-                ))
-        else:
-            text_lines.append("Need both SpO₂ and EtCO₂ to compute correlation.")
-        text_lines.append(f"**Status:** {basic_summary()}")
-
-    # 3) Generic “trends” or “what’s happening now”
-    elif "trend" in q or "happening" in q or "summary" in q or q in {"?", "now"}:
-        text_lines.append("**Situation summary (last ~30s):**")
-        text_lines.append(basic_summary())
-        # Small multi-sparkline set
-        for col, ylabel in [("MAP","MAP (mmHg)"), ("HR","HR (bpm)"), ("SpO2","SpO₂ (%)"), ("EtCO2","EtCO₂ (mmHg)"), ("RR","RR (bpm)")]:
-            if col in w.columns:
-                figs.append((f"{col} last 30s", _mini_line_fig(xidx, w[col].values, ylabel, f"{col} — last 30s")))
-        # Add a quick reasoning hint
-        hints = []
-        if trends.get("MAP",0) < -1.5 and trends.get("HR",0) > 0.8:
-            hints.append("Pattern consistent with relative hypovolemia (MAP↓ + HR↑).")
-        if trends.get("EtCO2",0) > 1.0 and trends.get("RR",0) < -0.5:
-            hints.append("Pattern consistent with hypoventilation (EtCO₂↑ + RR↓).")
-        if hints:
-            text_lines.append("**Reasoning hint:** " + " ".join(hints))
-
-    # 4) Fallback: try to pick a best-effort summary
-    else:
-        text_lines.append("**I interpreted your question as a general status request.**")
-        text_lines.append(basic_summary())
-        # Provide at least one helpful figure
-        if "MAP" in w.columns:
-            figs.append(("MAP last 30s", _mini_line_fig(xidx, w["MAP"].values, "MAP (mmHg)", "MAP — last 30s")))
-        if "SpO2" in w.columns and "EtCO2" in w.columns:
-            c = _safe_corr(w["SpO2"].values, w["EtCO2"].values)
-            if c is not None:
-                figs.append((
-                    "SpO₂ vs EtCO₂ (last 30s)",
-                    _scatter_fig(w["SpO2"].values, w["EtCO2"].values, "SpO₂ (%)", "EtCO₂ (mmHg)", "SpO₂ vs EtCO₂ — last 30s"),
-                ))
-
-    # Build final text
-    text = "\n\n".join(text_lines) if text_lines else "I’m still learning to answer that. Try asking about MAP trends or SpO₂ vs EtCO₂ correlation."
-    return {"text": text, "figs": figs}
-
-# -------------------------------
-# Voice module availability check
-# -------------------------------
-def voice_available() -> bool:
-    """Return True if voice modules are installed and importable."""
-    try:
-        import audio_recorder_streamlit  # noqa: F401
-        import speech_recognition  # noqa: F401
-        import pydub  # noqa: F401
+        import speech_recognition  # type: ignore
+        import sounddevice  # type: ignore
+        import wavio  # type: ignore
         return True
     except Exception:
         return False
-def voice_widget(timeout_sec: float = 8.0, phrase_timeout: float = 1.0) -> Optional[str]:
+
+
+# ---- Voice capture widget (mic -> WAV bytes -> transcription) ----
+def voice_widget():
     """
-    Minimal voice capture that won’t crash if optional deps are missing.
-    Returns transcribed text or None.
+    Returns transcribed text from the user's microphone, or "" if nothing captured.
+    Uses audio_recorder_streamlit for capture and SpeechRecognition for transcription.
+    Safe: imports are scoped and failures fall back gracefully.
     """
     try:
-        from audio_recorder_streamlit import audio_recorder  # type: ignore
-        import speech_recognition as sr  # type: ignore
+        from audio_recorder_streamlit import audio_recorder  # pip install audio-recorder-streamlit
+        import speech_recognition as sr                      # pip install SpeechRecognition
+        import io
+        import streamlit as st
 
-        st.caption("Click the mic to record, click again to stop.")
+        # Show recorder; stops automatically on silence
         audio_bytes = audio_recorder(
-            pause_threshold=phrase_timeout,
+            pause_threshold=1.0,
             text="",
-            icon_size="2x",
-            sample_rate=16000,
+            icon_size="2x"
         )
-        if not audio_bytes:
-            return None
 
+        if not audio_bytes:
+            return ""  # No audio recorded yet
+
+        # Convert to audio and transcribe
         recognizer = sr.Recognizer()
         with sr.AudioFile(io.BytesIO(audio_bytes)) as source:
-            audio = recognizer.record(source, duration=None)
+            audio = recognizer.record(source)
 
-        # Try Google Web Speech API (best-effort online); if it fails, fall back to Sphinx if installed
         try:
-            return recognizer.recognize_google(audio)
-        except Exception:
-            try:
-                return recognizer.recognize_sphinx(audio)  # offline if installed
-            except Exception as e:
-                st.warning(f"Could not transcribe audio ({e}).")
-                return None
-    except Exception as e:
-        st.info(f"Voice input unavailable or not installed: {e}")
-        return None
+            text = recognizer.recognize_google(audio)
+            return text.strip()
+        except Exception as e:
+            st.warning(f"Voice captured but transcription failed: {e}")
+            return ""
 
+    except Exception as e:
+        st.info(f"Voice capture not available (optional dependencies missing): {e}")
+        return ""
+# --- Column name resolver (handles SpO2 vs SpO₂, EtCO2 vs EtCO₂, etc.) ---
+def _resolve_cols(df: pd.DataFrame) -> dict:
+    def pick(cands):
+        for c in cands:
+            if c in df.columns:
+                return c
+        return None
+    return {
+        "Time": pick(["Time","time","t"]),
+        "MAP":  pick(["MAP","Map","map"]),
+        "HR":   pick(["HR","Heart Rate","heart_rate","Hr","hr"]),
+        "SpO2": pick(["SpO2","SpO₂","spo2","SPO2"]),
+        "EtCO2":pick(["EtCO2","EtCO₂","etco2","ETCO2","ETCO₂"]),
+        "RR":   pick(["RR","Resp Rate","Respiration","resp_rate","rr"]),
+    }
+
+# --- Conversational Output Formatter (Short Paragraph Version, robust) ---
+def answer_query(q: str, df: pd.DataFrame, sim_hz: int = 5):
+    """
+    HALO conversational reasoning engine (v4.2)
+    - Context-aware phrasing: answers directly based on the user's question
+    - Handles unlimited sequential questions without reinitialization
+    - Fully compatible with HALO v4.0 framework
+    """
+    if df is None or df.empty:
+        return {"text": "HALO has not yet received enough data to interpret physiologic trends.", "figs": []}
+
+    cols = _resolve_cols(df)
+    if not cols["Time"]:
+        return {"text": "No time index available in the current data.", "figs": []}
+
+    look_secs = 90
+    keep_cols = [c for c in [cols["Time"], cols["MAP"], cols["HR"], cols["SpO2"], cols["EtCO2"], cols["RR"]] if c]
+    w = _last_window(df[keep_cols], look_secs, max(int(sim_hz or 1), 1))
+    if w is None or w.empty:
+        return {"text": "No recent data available for this window.", "figs": []}
+
+    def S(name):
+        c = cols.get(name)
+        return w[c] if c and c in w.columns else None
+
+    def slope_safe(series):
+        try:
+            return _slope(series) if series is not None else 0.0
+        except Exception:
+            return 0.0
+
+    def last_safe(series):
+        try:
+            return float(series.iloc[-1])
+        except Exception:
+            return None
+
+    # Collect live metrics and slopes
+    vals = {v: last_safe(S(v)) for v in ["MAP", "HR", "SpO2", "EtCO2", "RR"]}
+    slopes = {v: slope_safe(S(v)) for v in ["MAP", "HR", "SpO2", "EtCO2", "RR"]}
+
+    map_s = slopes["MAP"]; hr_s = slopes["HR"]; spo2_s = slopes["SpO2"]; etco2_s = slopes["EtCO2"]; rr_s = slopes["RR"]
+
+    # Summary string
+    def seg(label, val, slope, unit):
+        if val is None:
+            return f"{label} —"
+        return f"{label} {int(round(val))} {unit} ({_fmt_trend(slope, per='/s')} over ~{look_secs}s)"
+    summary = " · ".join([
+        seg("MAP", vals["MAP"], map_s, "mmHg"),
+        seg("HR", vals["HR"], hr_s, "bpm"),
+        seg("SpO₂", vals["SpO2"], spo2_s, "%"),
+        seg("EtCO₂", vals["EtCO2"], etco2_s, "mmHg"),
+        seg("RR", vals["RR"], rr_s, "bpm"),
+    ])
+
+    # Correlation
+    s_spo2, s_et = S("SpO2"), S("EtCO2")
+    corr = _safe_corr(s_spo2.values, s_et.values) if s_spo2 is not None and s_et is not None else None
+    corr_txt = f"SpO₂–EtCO₂ correlation ≈ {corr:+.2f}." if corr is not None else ""
+
+    q_low = (q or "").lower().strip()
+
+    # --- Question focus detection ---
+    focus = None
+    for v in ["map", "hr", "spo2", "etco2", "rr"]:
+        if v in q_low:
+            focus = v.upper()
+            break
+
+    # --- Conversational framing ---
+    if any(w in q_low for w in ["why", "cause", "reason"]):
+        prefix = "Based on your question, the most likely physiologic reason is:"
+    elif any(w in q_low for w in ["what", "status", "show", "trend"]):
+        prefix = "Here’s what I’m currently observing:"
+    elif any(w in q_low for w in ["is", "does", "are there", "sign", "stable", "unstable", "normal"]):
+        prefix = "Interpreting your question — I detect that:"
+    elif any(w in q_low for w in ["how long", "predict", "when"]):
+        prefix = "Forecast based on current data:"
+    elif any(w in q_low for w in ["should", "recommend", "action", "do"]):
+        prefix = "My reasoning suggests the next best step is:"
+    else:
+        prefix = "Here’s what I’m seeing in the current signals:"
+
+    # --- Focused reasoning & actions ---
+    reason = ""
+    action_text = ""
+
+    if focus == "RR":
+        rr = vals["RR"]
+        if rr is None:
+            reason = "RR data unavailable."
+        elif rr < 8:
+            reason = f"RR {rr:.0f} bpm — bradypnea (below expected 10–20)."
+            action_text = "assess ventilation adequacy and check anesthetic depth."
+        elif rr > 28:
+            reason = f"RR {rr:.0f} bpm — tachypnea (above expected)."
+            action_text = "consider pain, light anesthesia, or hypercapnia."
+        else:
+            reason = f"RR {rr:.0f} bpm — within normal range."
+            action_text = "continue routine monitoring."
+
+    elif focus == "MAP":
+        m = vals["MAP"]
+        if m is None:
+            reason = "MAP data unavailable."
+        elif m < 65:
+            reason = f"MAP {m:.0f} mmHg — hypotension; possible underperfusion."
+            action_text = "evaluate anesthetic depth, volume status, or vasopressor need."
+        elif m > 100:
+            reason = f"MAP {m:.0f} mmHg — hypertension; sympathetic stimulation possible."
+            action_text = "consider deepening anesthesia or addressing pain."
+        else:
+            reason = f"MAP {m:.0f} mmHg — within target range."
+            action_text = "no immediate intervention needed."
+
+    elif focus == "HR":
+        h = vals["HR"]
+        if h is None:
+            reason = "HR data unavailable."
+        elif h > 120:
+            reason = f"HR {h:.0f} bpm — tachycardia; sympathetic activation or hypovolemia possible."
+            action_text = "review analgesia and volume status."
+        elif h < 50:
+            reason = f"HR {h:.0f} bpm — bradycardia; vagal or drug effect possible."
+            action_text = "check recent dosing and stimulus."
+        else:
+            reason = f"HR {h:.0f} bpm — normal range."
+            action_text = "continue monitoring."
+
+    elif focus == "SPO2":
+        s = vals["SpO2"]
+        if s is None:
+            reason = "SpO₂ data unavailable."
+        elif s < 92:
+            reason = f"SpO₂ {s:.0f}% — hypoxemia."
+            action_text = "check airway, FiO₂, and probe placement."
+        else:
+            reason = f"SpO₂ {s:.0f}% — satisfactory oxygenation."
+            action_text = "maintain current settings."
+
+    elif focus == "ETCO2":
+        e = vals["EtCO2"]
+        if e is None:
+            reason = "EtCO₂ data unavailable."
+        elif e < 30:
+            reason = f"EtCO₂ {e:.0f} mmHg — hypocapnia; likely hyperventilation."
+            action_text = "reduce ventilation rate if appropriate."
+        elif e > 50:
+            reason = f"EtCO₂ {e:.0f} mmHg — hypercapnia; likely hypoventilation."
+            action_text = "increase ventilation or check circuit."
+        else:
+            reason = f"EtCO₂ {e:.0f} mmHg — normal range."
+            action_text = "continue monitoring."
+
+    else:
+        # Global fallback reasoning if question is generic
+        if map_s < -0.3 and hr_s > 0.3:
+            reason = "MAP falling with compensatory HR rise — possible early hypovolemia."
+            action_text = "assess fluids and anesthetic depth."
+        elif spo2_s < -0.3 and etco2_s > 0.3:
+            reason = "SpO₂ dropping while EtCO₂ rising — likely hypoventilation."
+            action_text = "optimize airway or ventilation."
+        else:
+            reason = "signals largely stable across monitored parameters."
+            action_text = "no immediate intervention needed."
+
+    # --- Compose final response ---
+    text = (
+        f"**{prefix}** {reason} "
+        f"Currently: {summary}. {corr_txt} "
+        f"Top suggested action: {action_text}"
+    )
+
+    return {"text": text, "figs": []}
 
 # -------------- Page / Branding --------------
 st.set_page_config(page_title="HALO v4.0", page_icon="🛡️", layout="wide")
@@ -425,6 +288,7 @@ _setdefault("events", [])
 _setdefault("audit", [])
 _setdefault("sim_val", {"HR":80,"SpO2":97,"MAP":80,"EtCO2":37,"RR":12})
 _setdefault("sim_time", 0)
+_setdefault("conversation_log", [])
 
 # Thresholds (base)
 _setdefault("low_spo2", 92)
@@ -1143,6 +1007,48 @@ def render_conversational_assistant():
             return ranked[0] if ranked else {}
         except Exception:
             return {}
+# ---------- Q&A helpers (must appear before answer_query) ----------
+def _last_window(df: pd.DataFrame, seconds: int, sim_hz: int) -> pd.DataFrame:
+    """Return the last <seconds> of rows based on sim_hz; safe on empty."""
+    if df is None or df.empty or sim_hz is None or sim_hz <= 0:
+        return df if df is not None else pd.DataFrame()
+    n = max(1, min(len(df), int(seconds * sim_hz)))
+    return df.iloc[-n:].copy()
+
+def _slope(series: pd.Series) -> float:
+    """Simple end-start slope over the provided series; safe on short series."""
+    try:
+        if series is None or len(series) < 2:
+            return 0.0
+        return float(series.iloc[-1] - series.iloc[0])
+    except Exception:
+        return 0.0
+
+def _fmt_trend(val: float, units: str = "", per: str = "") -> str:
+    arrow = "↑" if val > 0 else ("↓" if val < 0 else "→")
+    return f"{arrow} {abs(val):.1f}{units}{per}"
+
+def _safe_corr(a: np.ndarray | list, b: np.ndarray | list):
+    """Pearson r with guards; returns None if not computable."""
+    try:
+        a = np.asarray(a); b = np.asarray(b)
+        if a.size < 3 or b.size < 3:
+            return None
+        c = float(np.corrcoef(a, b)[0, 1])
+        return None if np.isnan(c) else c
+    except Exception:
+        return None
+
+def _mini_line_fig(x, y, ylabel: str, title: str = ""):
+    """Tiny matplotlib line fig used by the assistant fallback visuals."""
+    fig, ax = plt.subplots(figsize=(4.5, 2.0))
+    ax.plot(x, y, linewidth=2)
+    ax.set_ylabel(ylabel)
+    ax.set_xticks([])
+    ax.set_title(title)
+    fig.tight_layout()
+    return fig
+# -------------------------------------------------------------------
 
     def _answer_query(df_in: pd.DataFrame, q: str) -> tuple[str, list[tuple[str, str]]]:
         """
@@ -1345,32 +1251,73 @@ final_q = voice_text if (voice_text and len(voice_text) > 0) else q_text
 do_answer = st.button("Get HALO Answer", type="primary", key="answer_btn") or bool(voice_text)
 
 if do_answer:
+    # Get the answer
     resp = answer_query(final_q, df, int(st.session_state.get("sim_hz", 5)))
-    st.markdown(f"""
-    <div style="
-        border-left:10px solid #1e62ff;
-        background:#e9f0ff; color:#0a0a0a;
-        padding:14px 18px;border-radius:10px;margin:10px 0;
-        font-size:1.02rem;line-height:1.5;box-shadow:0 2px 6px rgba(0,0,0,0.12);
-        ">
-        <div style="font-weight:800;color:#0b2a6b;font-size:1.2rem;margin-bottom:6px;">HALO Response</div>
-        <div>{resp['text'].replace('\n','<br>')}</div>
-    </div>
-    """, unsafe_allow_html=True)
 
-# Always show a live summary under the assistant
-live_summary = live_summary_block(df, int(st.session_state.get("sim_hz", 5)))
-st.markdown(f"""
-<div style="
-    border-left:10px solid #0a8a0a;
-    background:#e8f7e8; color:#0a0a0a;
-    padding:14px 18px;border-radius:10px;margin:10px 0;
-    font-size:1.0rem;line-height:1.5;box-shadow:0 2px 6px rgba(0,0,0,0.12);
-    ">
-    <div style="font-weight:800;color:#0a5a0a;font-size:1.1rem;margin-bottom:6px;">Live Situation Summary</div>
-    <div>{live_summary.replace('\n','<br>')}</div>
-</div>
-""", unsafe_allow_html=True)
+    # Initialize memory if not present
+    if "conversation_log" not in st.session_state:
+        st.session_state.conversation_log = []
+
+    # Save Q&A pair (limit 3)
+    st.session_state.conversation_log.append({"q": final_q, "a": resp["text"]})
+    st.session_state.conversation_log = st.session_state.conversation_log[-3:]
+
+    # --- Display HALO’s response ---
+    st.markdown(
+        f"""
+        <div style="
+            border-left:10px solid #1e62ff;
+            background:#e9f0ff; color:#0a0a0a;
+            padding:14px 18px;border-radius:10px;margin:10px 0;
+            font-size:1.02rem;line-height:1.5;box-shadow:0 2px 6px rgba(0,0,0,0.12);
+        ">
+            <div style="font-weight:800;color:#0b2a6b;font-size:1.2rem;margin-bottom:6px;">
+                HALO Response
+            </div>
+            <div>{resp['text'].replace('\n','<br>')}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # --- Show conversation memory ---
+    # --- Show conversation memory ---
+if st.session_state.conversation_log:
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.markdown(
+        """
+        <h4 style="
+            color:#0b2a6b;
+            font-weight:800;
+            margin-top:1rem;
+            margin-bottom:0.5rem;
+        ">
+            🧠 Recent HALO Conversation
+        </h4>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    for i, entry in enumerate(reversed(st.session_state.conversation_log), 1):
+        st.markdown(
+            f"""
+            <div style="
+                margin-bottom:14px;
+                padding:12px 14px;
+                border-left:5px solid #1e62ff;
+                background:#eef3ff;
+                border-radius:10px;
+                box-shadow:0 1px 4px rgba(0,0,0,0.1);
+                color:#0a0a0a;
+                font-size:0.95rem;
+                line-height:1.5;
+            ">
+                <b style="color:#0b2a6b;">Q{i}:</b> {entry['q']}<br>
+                <b style="color:#1e62ff;">A{i}:</b> {entry['a']}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 # -------------- Audit & Export --------------
 st.subheader("Alarm Audit Trail")
