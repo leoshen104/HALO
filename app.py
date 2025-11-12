@@ -159,7 +159,7 @@ def live_summary(df):
                 margin-bottom:20px;
             ">
                 <h4 style="color:#0b2a6b; margin-bottom:8px;">
-                    🧩 Live Situation Summary
+                     Live Situation Summary
                 </h4>
                 <p style="color:#0a0a0a; font-size:0.95rem; line-height:1.5;">
                     {summary_text}
@@ -623,6 +623,7 @@ df = st.session_state.history
 st.session_state["df"] = df  # expose for assistant safely
 
 # -------------- Vitals Charts (top) --------------
+# -------------- Vitals Charts (top) --------------
 c1, c2, c3, c4, c5 = st.columns(5)
 if not df.empty:
     c1.subheader("HR (bpm)")
@@ -638,83 +639,66 @@ if not df.empty:
 else:
     st.info("Click Start (Live) or upload a CSV (Replay).")
 
-# --- 🧩 Live Situation Summary (real-time block) ---
-def live_summary_block(df_: pd.DataFrame):
+# --- Live Situation Summary (always-on, no emojis) ---
+def halo_live_summary(df_: pd.DataFrame):
+    import numpy as np
     if df_ is None or df_.empty:
-        st.info("Collecting data…")
+        st.markdown(
+            """
+            <div style="
+                background:#f5f7fb; border-left:6px solid #8aa0c8;
+                padding:12px 14px; border-radius:10px; margin:16px 0 20px;
+                color:#0a0a0a; box-shadow:0 1px 4px rgba(0,0,0,0.08);
+            ">
+                <h4 style="color:#0b2a6b; margin:0 0 6px;">Live Situation Summary</h4>
+                <p style="margin:0;">Waiting for data… start Live or upload a Replay.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         return
+
     window = df_.tail(90)
-    slopes, summary = {}, []
+    def slope_of(col, thr_small=1):
+        if col not in window.columns or len(window[col]) < 2:
+            return 0.0
+        vals = window[col].astype(float).values
+        if np.allclose(vals.max(), vals.min()):
+            return 0.0
+        return float(vals[-1] - vals[0]) / max(len(vals), 1)
 
-    for col in ["MAP", "HR", "SpO2", "EtCO2", "RR"]:
-        if col in window.columns:
-            vals = window[col].values
-            slopes[col] = (vals[-1] - vals[0]) / max(len(vals), 1)
+    s_map  = slope_of("MAP")
+    s_hr   = slope_of("HR")
+    s_spo2 = slope_of("SpO2")
+    s_et   = slope_of("EtCO2")
+    s_rr   = slope_of("RR")
 
-    # Quick interpretive summary
-    if slopes.get("MAP", 0) < -0.3:
-        summary.append("MAP falling — possible hypoperfusion.")
-    elif slopes.get("MAP", 0) > 0.3:
-        summary.append("MAP rising — possible pressor response.")
-    else:
-        summary.append("MAP stable.")
+    parts = []
+    parts.append("MAP falling — possible hypoperfusion." if s_map < -0.3 else ("MAP rising — possible pressor response or recovery." if s_map > 0.3 else "MAP stable."))
+    parts.append("HR increasing — possible pain, stress, or compensation." if s_hr > 0.3 else ("HR decreasing — possible deep anesthesia or drug effect." if s_hr < -0.3 else "HR stable."))
+    parts.append("SpO₂ trending down — check airway or oxygenation." if s_spo2 < -0.2 else ("SpO₂ improving." if s_spo2 > 0.2 else "SpO₂ stable."))
+    parts.append("EtCO₂ falling — hyperventilation or perfusion drop." if s_et < -0.3 else ("EtCO₂ rising — hypoventilation or CO₂ retention." if s_et > 0.3 else "EtCO₂ stable."))
+    parts.append("RR rising — compensatory hyperventilation." if s_rr > 0.3 else ("RR decreasing — sedation or airway depression." if s_rr < -0.3 else "RR stable."))
 
-    if slopes.get("HR", 0) > 0.3:
-        summary.append("HR rising — possible pain, stress, or compensation.")
-    elif slopes.get("HR", 0) < -0.3:
-        summary.append("HR falling — drug or deep anesthesia effect.")
-    else:
-        summary.append("HR stable.")
+    summary_text = " · ".join(parts)
 
-    if slopes.get("SpO2", 0) < -0.2:
-        summary.append("SpO₂ dropping — check airway/oxygenation.")
-    elif slopes.get("SpO2", 0) > 0.2:
-        summary.append("SpO₂ improving.")
-    else:
-        summary.append("SpO₂ stable.")
-
-    if slopes.get("EtCO2", 0) < -0.3:
-        summary.append("EtCO₂ falling — hyperventilation or perfusion drop.")
-    elif slopes.get("EtCO2", 0) > 0.3:
-        summary.append("EtCO₂ rising — hypoventilation or CO₂ retention.")
-    else:
-        summary.append("EtCO₂ stable.")
-
-    if slopes.get("RR", 0) > 0.3:
-        summary.append("RR rising — compensatory hyperventilation.")
-    elif slopes.get("RR", 0) < -0.3:
-        summary.append("RR falling — sedation or airway depression.")
-    else:
-        summary.append("RR stable.")
-
-    summary_text = " · ".join(summary)
     st.markdown(
         f"""
         <div style="
-            background-color:#eef3ff;
-            border-left:6px solid #1e62ff;
-            padding:12px 14px;
-            border-radius:10px;
-            box-shadow:0 1px 4px rgba(0,0,0,0.1);
-            margin-top:16px;
-            margin-bottom:20px;
+            background:#eef3ff; border-left:6px solid #1e62ff;
+            padding:12px 14px; border-radius:10px; margin:16px 0 20px;
+            color:#0a0a0a; box-shadow:0 1px 4px rgba(0,0,0,0.1);
         ">
-            <h4 style="color:#0b2a6b;margin-bottom:8px;">
-                🧩 Live Situation Summary
-            </h4>
-            <p style="color:#0a0a0a;font-size:0.95rem;line-height:1.5;">
-                {summary_text}
-            </p>
+            <h4 style="color:#0b2a6b; margin:0 0 8px;">Live Situation Summary</h4>
+            <p style="margin:0; font-size:0.95rem; line-height:1.5;">{summary_text}</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-# Render live summary if data present
-if not df.empty:
-    live_summary_block(df)
-
-# -------------- Helpers for alarms & summary --------------
+# --- call it right after your charts ---
+if True:
+    halo_live_summary(df)
 
 
 # -------------- Helpers for alarms & summary --------------
@@ -1109,7 +1093,7 @@ def render_conversational_assistant():
     st.session_state._assistant_rendered = True
 
     st.divider()
-    st.subheader("🎙️ Conversational Assistant")
+    st.subheader("Conversational Assistant")
 
     # ---- Helpers (read-only, do not mutate widget keys after creation) ----
     def _safe_last(series, default=None):
@@ -1404,7 +1388,7 @@ def _mini_line_fig(x, y, ylabel: str, title: str = ""):
 
 # ----- Render Assistant (single; bottom) -----
 st.divider()
-st.subheader("💬 Conversational Assistant")
+st.subheader("Conversational Assistant")
 
 colQ1, colQ2 = st.columns([3,1])
 q_text = colQ1.text_input(
@@ -1416,12 +1400,12 @@ q_text = colQ1.text_input(
 voice_text = None
 if voice_available():
     with colQ2:
-        with st.expander("🎤 Voice (Start/Stop)"):
+        with st.expander("Voice (Start/Stop)"):
             voice_text = voice_widget()
             if voice_text:
                 st.success(f"Transcribed: “{voice_text}”")
 else:
-    st.caption("🎤 Voice capture not available (missing dependencies). You can still type questions.")
+    st.caption(" Voice capture not available (missing dependencies). You can still type questions.")
 
 final_q = voice_text if (voice_text and len(voice_text) > 0) else q_text
 
@@ -1471,7 +1455,7 @@ if st.session_state.conversation_log:
             margin-top:1rem;
             margin-bottom:0.5rem;
         ">
-            🧠 Recent HALO Conversation
+             Recent HALO Conversation
         </h4>
         """,
         unsafe_allow_html=True,
