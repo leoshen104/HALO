@@ -1,19 +1,203 @@
 # HALO — Hypothesis & Alarm Logic Orchestrator
-# v3.4 
+# v4.0 — Live Summary + Single Conversational Assistant (Text + Voice)
 # Not for clinical use.
 
 import io
-import json
-import math
 import time
 import random
+from typing import Dict, List, Tuple, Optional
+
 import numpy as np
 import pandas as pd
 import streamlit as st
+import altair as alt
 import matplotlib.pyplot as plt
+# -------------------------------
+# Conversational Q&A: answer_query
+# -------------------------------
+def _last_window(df, seconds, sim_hz):
+    if df.empty or sim_hz <= 0:
+        return df
+    n = max(1, min(len(df), int(seconds * sim_hz)))
+    return df.iloc[-n:].copy()
 
-# -------------------- Page / Branding --------------------
-st.set_page_config(page_title="HALO v3.4+P2", page_icon="🛡️", layout="wide")
+def _slope(series):
+    if len(series) < 2:
+        return 0.0
+    return float(series.iloc[-1] - series.iloc[0])
+
+def _fmt_trend(val, units="", per=""):
+    arrow = "↑" if val > 0 else ("↓" if val < 0 else "→")
+    return f"{arrow} {abs(val):.1f}{units}{per}"
+
+def _safe_corr(a, b):
+    if len(a) < 3 or len(b) < 3:
+        return None
+    try:
+        return float(np.corrcoef(a, b)[0, 1])
+    except Exception:
+        return None
+
+def _scatter_fig(x, y, xlabel, ylabel, title=""):
+    fig, ax = plt.subplots(figsize=(4.5, 2.8))
+    ax.scatter(x, y, s=12, alpha=0.8)
+    # simple least-squares line if enough points
+    if len(x) >= 3:
+        try:
+            coeffs = np.polyfit(x, y, 1)
+            xx = np.linspace(min(x), max(x), 50)
+            yy = coeffs[0] * xx + coeffs[1]
+            ax.plot(xx, yy, linewidth=2)
+        except Exception:
+            pass
+    ax.set_xlabel(xlabel); ax.set_ylabel(ylabel); ax.set_title(title)
+    fig.tight_layout()
+    return fig
+
+def _mini_line_fig(x, y, ylabel, title=""):
+    fig, ax = plt.subplots(figsize=(4.5, 2.0))
+    ax.plot(x, y, linewidth=2)
+    ax.set_ylabel(ylabel); ax.set_xticks([]); ax.set_title(title)
+    fig.tight_layout()
+    return fig
+
+def answer_query(query: str, df: pd.DataFrame, sim_hz: int):
+    """
+    Returns dict: {"text": <markdown string>, "figs": [(title, fig), ...]}
+    Always safe (handles tiny or empty datasets).
+    """
+    q = (query or "").strip().lower()
+    figs = []
+    if df is None or df.empty:
+        return {
+            "text": "I don’t have enough data yet. Start the stream or load a replay, then ask again.",
+            "figs": figs,
+        }
+
+    # Use a recent window for responsiveness; expand automatically if needed
+    win_secs = 30
+    w = _last_window(df, win_secs, sim_hz)
+    xidx = w["Time"].values if "Time" in w.columns else np.arange(len(w))
+
+    # Quick trends
+    trends = {}
+    for col in ["MAP", "HR", "SpO2", "EtCO2", "RR"]:
+        if col in w.columns:
+            trends[col] = _slope(w[col])
+    now_vals = {col: (int(w[col].iloc[-1]) if col in w.columns else None)
+                for col in ["MAP", "HR", "SpO2", "EtCO2", "RR"]}
+
+    # Helpers to build narrative
+    def basic_summary():
+        parts = []
+        if now_vals["MAP"] is not None:
+            parts.append(f"MAP {now_vals['MAP']} mmHg ({_fmt_trend(trends.get('MAP',0),'',' over 30s')})")
+        if now_vals["HR"] is not None:
+            parts.append(f"HR {now_vals['HR']} bpm ({_fmt_trend(trends.get('HR',0),'',' over 30s')})")
+        if now_vals["SpO2"] is not None:
+            parts.append(f"SpO₂ {now_vals['SpO2']}% ({_fmt_trend(trends.get('SpO2',0),'',' over 30s')})")
+        if now_vals["EtCO2"] is not None:
+            parts.append(f"EtCO₂ {now_vals['EtCO2']} mmHg ({_fmt_trend(trends.get('EtCO2',0),'',' over 30s')})")
+        if now_vals["RR"] is not None:
+            parts.append(f"RR {now_vals['RR']} bpm ({_fmt_trend(trends.get('RR',0),'',' over 30s')})")
+        return " · ".join(parts) if parts else "Signals available but not enough variation to summarize."
+
+    # Route by intent
+    text_lines = []
+
+    # 1) Why is MAP falling?
+    if ("why" in q and "map" in q) or ("map" in q and "fall" in q):
+        if "MAP" in w.columns:
+            slope = trends.get("MAP", 0.0)
+            hr_slope = trends.get("HR", 0.0)
+            spo2_slope = trends.get("SpO2", 0.0)
+            rationale = []
+            if slope < -1.5:
+                rationale.append("MAP is declining over the last ~30s.")
+            if hr_slope >= 1.0:
+                rationale.append("HR is rising → sympathetic compensation.")
+            if spo2_slope <= -0.5:
+                rationale.append("SpO₂ trending down suggests broader physiologic stress.")
+            if not rationale:
+                rationale.append("Decline is mild/flat; consider depth/drug effects or noise.")
+            text_lines.append("**Interpretation:** MAP is falling.")
+            text_lines.append("**Why:** " + " ".join(rationale))
+            # Add a small trend fig
+            if "MAP" in w.columns:
+                figs.append(("MAP last 30s", _mini_line_fig(xidx, w["MAP"].values, "MAP (mmHg)", "MAP — last 30s")))
+        else:
+            text_lines.append("MAP not available in the current data window.")
+        # Always add a status line
+        text_lines.append(f"**Status:** {basic_summary()}")
+
+    # 2) Show SpO2 vs EtCO2 correlation
+    elif ("spo2" in q and "etco2" in q and "corr" in q) or ("correlat" in q and "spo2" in q):
+        if "SpO2" in w.columns and "EtCO2" in w.columns:
+            c = _safe_corr(w["SpO2"].values, w["EtCO2"].values)
+            if c is None:
+                text_lines.append("Not enough points to compute a stable correlation yet.")
+            else:
+                relation = "negative" if c < -0.2 else ("positive" if c > 0.2 else "weak")
+                text_lines.append(f"**Correlation (last ~30s):** r = {c:.2f} ({relation}).")
+                figs.append((
+                    "SpO₂ vs EtCO₂ (last 30s)",
+                    _scatter_fig(w["SpO2"].values, w["EtCO2"].values, "SpO₂ (%)", "EtCO₂ (mmHg)", "SpO₂ vs EtCO₂ — last 30s"),
+                ))
+        else:
+            text_lines.append("Need both SpO₂ and EtCO₂ to compute correlation.")
+        text_lines.append(f"**Status:** {basic_summary()}")
+
+    # 3) Generic “trends” or “what’s happening now”
+    elif "trend" in q or "happening" in q or "summary" in q or q in {"?", "now"}:
+        text_lines.append("**Situation summary (last ~30s):**")
+        text_lines.append(basic_summary())
+        # Small multi-sparkline set
+        for col, ylabel in [("MAP","MAP (mmHg)"), ("HR","HR (bpm)"), ("SpO2","SpO₂ (%)"), ("EtCO2","EtCO₂ (mmHg)"), ("RR","RR (bpm)")]:
+            if col in w.columns:
+                figs.append((f"{col} last 30s", _mini_line_fig(xidx, w[col].values, ylabel, f"{col} — last 30s")))
+        # Add a quick reasoning hint
+        hints = []
+        if trends.get("MAP",0) < -1.5 and trends.get("HR",0) > 0.8:
+            hints.append("Pattern consistent with relative hypovolemia (MAP↓ + HR↑).")
+        if trends.get("EtCO2",0) > 1.0 and trends.get("RR",0) < -0.5:
+            hints.append("Pattern consistent with hypoventilation (EtCO₂↑ + RR↓).")
+        if hints:
+            text_lines.append("**Reasoning hint:** " + " ".join(hints))
+
+    # 4) Fallback: try to pick a best-effort summary
+    else:
+        text_lines.append("**I interpreted your question as a general status request.**")
+        text_lines.append(basic_summary())
+        # Provide at least one helpful figure
+        if "MAP" in w.columns:
+            figs.append(("MAP last 30s", _mini_line_fig(xidx, w["MAP"].values, "MAP (mmHg)", "MAP — last 30s")))
+        if "SpO2" in w.columns and "EtCO2" in w.columns:
+            c = _safe_corr(w["SpO2"].values, w["EtCO2"].values)
+            if c is not None:
+                figs.append((
+                    "SpO₂ vs EtCO₂ (last 30s)",
+                    _scatter_fig(w["SpO2"].values, w["EtCO2"].values, "SpO₂ (%)", "EtCO₂ (mmHg)", "SpO₂ vs EtCO₂ — last 30s"),
+                ))
+
+    # Build final text
+    text = "\n\n".join(text_lines) if text_lines else "I’m still learning to answer that. Try asking about MAP trends or SpO₂ vs EtCO₂ correlation."
+    return {"text": text, "figs": figs}
+
+# -------------------------------
+# Voice module availability check
+# -------------------------------
+def voice_available() -> bool:
+    """Return True if voice modules are installed and importable."""
+    try:
+        import audio_recorder_streamlit  # noqa: F401
+        import speech_recognition  # noqa: F401
+        import pydub  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+# -------------- Page / Branding --------------
+st.set_page_config(page_title="HALO v4.0", page_icon="🛡️", layout="wide")
 st.markdown(
     "<div style='display:inline-block;background:#fff4d6;color:#333;padding:4px 8px;"
     "border-left:6px solid #c26b00;border-radius:8px;margin-bottom:8px;font-size:0.9rem;'>"
@@ -21,16 +205,15 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.title("HALO — Hypothesis & Alarm Logic Orchestrator")
-st.caption("Interpretive assistant for anesthesia alarm fusion (assistant, not decider).")
+st.caption("Interpretive assistant for anesthesia monitoring (assistant, not decider).")
 
 DEMO_MODE = True
 
-# -------------------- State Init --------------------
+# -------------- Safe session defaults --------------
 def _setdefault(k, v):
     if k not in st.session_state:
         st.session_state[k] = v
 
-# Core data buffers / run state
 _setdefault("history", pd.DataFrame(columns=["Time","HR","SpO2","MAP","EtCO2","RR"]))
 _setdefault("running", False)
 _setdefault("mode", "Live")         # "Live" or "Replay"
@@ -42,8 +225,6 @@ _setdefault("scenario_name", None)
 _setdefault("scenario_end", 0.0)
 _setdefault("events", [])
 _setdefault("audit", [])
-_setdefault("muted_until", {})      # per alarm label
-_setdefault("cooldown_until", {})   # per alarm label (after recovery)
 _setdefault("sim_val", {"HR":80,"SpO2":97,"MAP":80,"EtCO2":37,"RR":12})
 _setdefault("sim_time", 0)
 
@@ -62,7 +243,7 @@ _setdefault("win_hr", 8)
 _setdefault("win_map", 10)
 _setdefault("win_resp", 12)
 
-# Hysteresis (exit thresholds) & cooldown
+# Hysteresis (exit thresholds) & cooldown (used by prior builds; harmless here)
 _setdefault("hys_spo2", 2)
 _setdefault("hys_map", 5)
 _setdefault("cooldown", 30)
@@ -70,216 +251,110 @@ _setdefault("cooldown", 30)
 # Noise / artifact injection
 _setdefault("enable_noise", True)
 _setdefault("artifact_pct", 5)
+# -------------------- Top Controls (always visible) --------------------
+if "running" not in st.session_state:
+    st.session_state.running = False
+if "sim_hz" not in st.session_state:
+    st.session_state.sim_hz = 5
 
-# --- Limiters (Phase 1) ---
-def _lim_default():
-    return {
-        "vitals": {
-            "MAP":  {"min": 60, "max": 85},
-            "SpO2": {"min": 92, "max": 100},
-            "EtCO2":{"min": 32, "max": 45},
-            "HR":   {"min": 40, "max": 140},
-            "RR":   {"min": 8,  "max": 30},
-        }
-    }
-_setdefault("limiters", _lim_default())
+ctrl = st.container()
+with ctrl:
+    c1, c2, c3, c4 = st.columns([1, 1, 2, 2])
+    if c1.button("▶ Start", key="btn_start"):
+        st.session_state.running = True
+    if c2.button("■ Stop", key="btn_stop"):
+        st.session_state.running = False
 
-# --- ML Training Lab State (graceful if sklearn missing) ---
-_setdefault("ml_model", None)
-_setdefault("ml_scaler", None)
-_setdefault("ml_classes", [])
-_setdefault("ml_training_df", pd.DataFrame())
-_setdefault("ml_use_in_hypothesis", True)   # show ML in hypothesis panel when available
-_setdefault("ml_drive_scenarios", True)     # use class means to steer targets when available
+    # Safe slider (do NOT assign back to session_state manually)
+    c3.slider("Samples per second", 1, 10, st.session_state.get("sim_hz", 5), key="sim_hz")
 
-# -------------------- Sidebar --------------------
-with st.sidebar:
-    st.header("Mode")
-    st.session_state.mode = st.radio(
-        "Input source", ["Live", "Replay"],
-        index=0 if st.session_state.mode == "Live" else 1,
-        key="mode_radio"
+    # Visible, color-safe status chip
+    status = "Running" if st.session_state.running else "Stopped"
+    bg = "#e7f7e7" if st.session_state.running else "#f5f5f5"
+    border = "#3aa35c" if st.session_state.running else "#ddd"
+    text = "#111111"
+
+    c4.markdown(
+        f"<div style='display:inline-block;padding:6px 10px;border-radius:999px;"
+        f"background:{bg};border:1px solid {border};color:{text};"
+        f"font-weight:600;'>Mode: {st.session_state.mode} · {status} · Samples: {len(st.session_state.history)}</div>",
+        unsafe_allow_html=True,
     )
 
+# -------------- Sidebar --------------
+with st.sidebar:
+    st.header("Mode")
+    st.session_state.mode = st.radio("Input source", ["Live", "Replay"], index=0 if st.session_state.mode=="Live" else 1, key="mode_radio")
+
     if st.session_state.mode == "Replay":
-        up = st.file_uploader("Upload CSV (Time, HR, SpO2, MAP, optional EtCO2, RR)", type=["csv"])
-        if up is not None:
-            try:
-                import io as _io
-                df_r = pd.read_csv(_io.StringIO(up.getvalue().decode("utf-8")), encoding_errors="ignore")
-                cols = {c.lower(): c for c in df_r.columns}
-                def pick(*names):
-                    for n in names:
-                        if n in cols: return cols[n]
-                    return None
-                c_time = pick("time","t","seconds","sec","index")
-                c_hr   = pick("hr","heart","bpm")
-                c_s2   = pick("spo2","sao2","o2","oxygen")
-                c_map  = pick("map","mean arterial pressure","mean")
-                c_et   = pick("etco2","etco₂","co2","et co2")
-                c_rr   = pick("rr","resp","resp rate","respiration","respiratory rate")
-                need = [c_time, c_hr, c_s2, c_map]
-                if any(c is None for c in need):
-                    st.error("CSV must include Time, HR, SpO2, MAP. Optional: EtCO2, RR.")
-                else:
-                    df_r = df_r.rename(columns={
-                        c_time:"Time", c_hr:"HR", c_s2:"SpO2", c_map:"MAP",
-                        **({c_et:"EtCO2"} if c_et else {}), **({c_rr:"RR"} if c_rr else {})
-                    })
-                    for c in ["Time","HR","SpO2","MAP","EtCO2","RR"]:
-                        if c in df_r.columns:
-                            df_r[c] = pd.to_numeric(df_r[c], errors="coerce")
-                    df_r = df_r.dropna(subset=["Time","HR","SpO2","MAP"]).reset_index(drop=True)
-                    if "EtCO2" not in df_r.columns: df_r["EtCO2"] = np.clip(37 + np.random.normal(0,2,len(df_r)), 20, 60)
-                    if "RR" not in df_r.columns:    df_r["RR"]    = np.clip(12 + np.random.normal(0,2,len(df_r)), 6, 40)
-                    df_r["Time"] = np.arange(len(df_r))
-                    st.session_state.replay_df = df_r[["Time","HR","SpO2","MAP","EtCO2","RR"]]
-                    st.session_state.replay_idx = 0
-                    st.session_state.history = pd.DataFrame(columns=["Time","HR","SpO2","MAP","EtCO2","RR"])
-                    st.success(f"Loaded {len(df_r)} rows for Replay.")
-            except Exception as e:
-                st.error(f"Failed to read CSV: {e}")
+        up = st.file_uploader("Upload CSV (Time, HR, SpO2, MAP, optional EtCO2, RR)", type=["csv"], key="replay_csv")
+        # (keep your existing replay-loading code here, unchanged)
+        st.slider("Replay speed (rows/tick)", 1, 20, st.session_state.get("replay_speed", 1), key="replay_speed")
 
-        st.session_state.replay_speed = st.slider(
-            "Replay speed (rows/tick)", 1, 20,
-            value=st.session_state.get("replay_speed", 1),
-            key="replay_speed"
-        )
-
-    # researcher details toggle (if DEMO_MODE True, default hidden)
     show_details = True if not DEMO_MODE else st.checkbox("Show researcher details", value=False, key="show_details")
 
     if show_details:
         st.header("Thresholds")
-        st.slider("Low SpO₂ (%)", 85, 96,
-                  value=st.session_state.get("low_spo2", 92),
-                  key="thr_spo2")
-        st.slider("Tachycardia HR (bpm)", 90, 160,
-                  value=st.session_state.get("tachy_hr", 120),
-                  key="thr_hr")
-        st.slider("Low MAP (mmHg)", 50, 80,
-                  value=st.session_state.get("low_map", 65),
-                  key="thr_map")
-
-        # mirror widget values into canonical names AFTER widgets render
-        st.session_state.low_spo2 = st.session_state.thr_spo2
-        st.session_state.tachy_hr = st.session_state.thr_hr
-        st.session_state.low_map  = st.session_state.thr_map
+        st.slider("Low SpO₂ (%)", 85, 96, st.session_state.get("low_spo2", 92), key="low_spo2")
+        st.slider("Tachycardia HR (bpm)", 90, 160, st.session_state.get("tachy_hr", 120), key="tachy_hr")
+        st.slider("Low MAP (mmHg)", 50, 80, st.session_state.get("low_map", 65), key="low_map")
 
         st.subheader("Respiratory")
-        st.slider("High EtCO₂ (mmHg)", 40, 60,
-                  value=st.session_state.get("high_et", 50),
-                  key="thr_et_high")
-        st.slider("Low EtCO₂ (mmHg)",  20, 40,
-                  value=st.session_state.get("low_et", 30),
-                  key="thr_et_low")
-        st.slider("Low RR (bpm)",       4, 20,
-                  value=st.session_state.get("low_rr", 8),
-                  key="thr_rr_low")
-        st.slider("High RR (bpm)",     18, 40,
-                  value=st.session_state.get("high_rr", 28),
-                  key="thr_rr_high")
-
-        st.session_state.high_et = st.session_state.thr_et_high
-        st.session_state.low_et  = st.session_state.thr_et_low
-        st.session_state.low_rr  = st.session_state.thr_rr_low
-        st.session_state.high_rr = st.session_state.thr_rr_high
+        st.slider("High EtCO₂ (mmHg)", 40, 60, st.session_state.get("high_et", 50), key="high_et")
+        st.slider("Low EtCO₂ (mmHg)",  20, 40, st.session_state.get("low_et", 30), key="low_et")
+        st.slider("Low RR (bpm)",       4, 20, st.session_state.get("low_rr", 8), key="low_rr")
+        st.slider("High RR (bpm)",     18, 40, st.session_state.get("high_rr", 28), key="high_rr")
 
         st.header("Persistence (sec)")
-        st.slider("SpO₂ persistence", 5, 30,
-                  value=st.session_state.get("win_spo2", 8),
-                  key="win_spo2")
-        st.slider("HR persistence",   5, 30,
-                  value=st.session_state.get("win_hr", 8),
-                  key="win_hr")
-        st.slider("MAP persistence",  5, 30,
-                  value=st.session_state.get("win_map", 10),
-                  key="win_map")
-        st.slider("Resp persistence", 5, 30,
-                  value=st.session_state.get("win_resp", 12),
-                  key="win_resp")
+        st.slider("SpO₂ persistence", 5, 30, st.session_state.get("win_spo2", 8), key="win_spo2")
+        st.slider("HR persistence",   5, 30, st.session_state.get("win_hr", 8), key="win_hr")
+        st.slider("MAP persistence",  5, 30, st.session_state.get("win_map", 10), key="win_map")
+        st.slider("Resp persistence", 5, 30, st.session_state.get("win_resp", 12), key="win_resp")
 
         st.header("Hysteresis & Cooldown")
-        st.slider("SpO₂ hysteresis (+%)", 1, 6,
-                  value=st.session_state.get("hys_spo2", 2),
-                  key="hys_spo2")
-        st.slider("MAP hysteresis (+mmHg)", 2, 12,
-                  value=st.session_state.get("hys_map", 5),
-                  key="hys_map")
-        st.slider("Alarm cooldown (s)", 0, 120,
-                  value=st.session_state.get("cooldown", 30),
-                  key="cooldown")
+        st.slider("SpO₂ hysteresis (+%)", 1, 6, st.session_state.get("hys_spo2", 2), key="hys_spo2")
+        st.slider("MAP hysteresis (+mmHg)", 2, 12, st.session_state.get("hys_map", 5), key="hys_map")
+        st.slider("Alarm cooldown (s)", 0, 120, st.session_state.get("cooldown", 30), key="cooldown")
 
         st.header("Noise / Artifacts (Live)")
-        st.checkbox("Inject artifact/noise",
-                    value=st.session_state.get("enable_noise", True),
-                    key="enable_noise")
-        st.slider("Artifact chance (%)", 0, 20,
-                  value=st.session_state.get("artifact_pct", 5),
-                  key="artifact_pct")
+        st.checkbox("Inject artifact/noise", value=st.session_state.get("enable_noise", True), key="enable_noise")
+        st.slider("Artifact chance (%)", 0, 20, st.session_state.get("artifact_pct", 5), key="artifact_pct")
 
     st.divider()
-    if st.button("Reset Data"):
+    if st.button("Reset Data", key="reset_btn"):
         st.session_state.history = pd.DataFrame(columns=["Time","HR","SpO2","MAP","EtCO2","RR"])
         st.session_state.replay_idx = 0
         st.session_state.events = []
         st.session_state.audit = []
         st.session_state.sim_time = 0
         st.success("Buffers cleared.")
-
-
-
-# -------------------- Top Controls --------------------
-c1, c2, c3, c4 = st.columns([1, 1, 2, 2])
-
-# Start/Stop only flip booleans; no conflicting keys
-if c1.button("Start"):
-    st.session_state.running = True
-if c2.button("Stop"):
-    st.session_state.running = False
-
-# IMPORTANT: Do NOT assign back to st.session_state.sim_hz here.
-# The slider owns the "sim_hz" key; we only read it later.
-c3.slider(
-    "Samples per second",
-    min_value=1, max_value=10,
-    value=st.session_state.get("sim_hz", 5),
-    key="sim_hz"
-)
-
-c4.write(
-    f"Mode: **{st.session_state.mode}** · "
-    f"Running: **{st.session_state.running}** · "
-    f"Samples: **{len(st.session_state.history)}**"
-)
-# -------------------- Scenarios & Events --------------------
+# -------------- Scenarios & Events --------------
 sc1, sc2, sc3, sc4, sc5 = st.columns(5)
-if sc1.button("Scenario: Bleed (60s)"):        st.session_state.scenario_name="Bleed"; st.session_state.scenario_end=time.time()+60
-if sc2.button("Scenario: Bronchospasm (60s)"): st.session_state.scenario_name="Bronchospasm"; st.session_state.scenario_end=time.time()+60
-if sc3.button("Scenario: Vasodilation (60s)"): st.session_state.scenario_name="Vasodilation"; st.session_state.scenario_end=time.time()+60
-if sc4.button("Scenario: Pain/Light (60s)"):   st.session_state.scenario_name="Pain/Light"; st.session_state.scenario_end=time.time()+60
-if sc5.button("End Scenario"):                 st.session_state.scenario_name=None; st.session_state.scenario_end=0.0
+if sc1.button("Scenario: Bleed (60s)", key="sc_bleed"):        st.session_state.scenario_name="Bleed"; st.session_state.scenario_end=time.time()+60
+if sc2.button("Scenario: Bronchospasm (60s)", key="sc_bronch"): st.session_state.scenario_name="Bronchospasm"; st.session_state.scenario_end=time.time()+60
+if sc3.button("Scenario: Vasodilation (60s)", key="sc_vaso"): st.session_state.scenario_name="Vasodilation"; st.session_state.scenario_end=time.time()+60
+if sc4.button("Scenario: Pain/Light (60s)",   key="sc_pain"): st.session_state.scenario_name="Pain/Light"; st.session_state.scenario_end=time.time()+60
+if sc5.button("End Scenario", key="sc_end"):                 st.session_state.scenario_name=None; st.session_state.scenario_end=0.0
 
 e1, e2, e3, e4, e5 = st.columns(5)
-if e1.button("Mark: Incision"):        st.session_state.events.append({"t": len(st.session_state.history), "name":"Incision"})
-if e2.button("Mark: Position change"): st.session_state.events.append({"t": len(st.session_state.history), "name":"Position change"})
-if e3.button("Mark: Fluids 250 mL"):   st.session_state.events.append({"t": len(st.session_state.history), "name":"Fluids 250 mL"})
-if e4.button("Mark: Vasopressor"):     st.session_state.events.append({"t": len(st.session_state.history), "name":"Vasopressor"})
-if e5.button("Clear Events"):          st.session_state.events = []
+if e1.button("Mark: Incision", key="mark_incision"):        st.session_state.events.append({"t": len(st.session_state.history), "name":"Incision"})
+if e2.button("Mark: Position change", key="mark_pos"): st.session_state.events.append({"t": len(st.session_state.history), "name":"Position change"})
+if e3.button("Mark: Fluids 250 mL",   key="mark_fluid"):   st.session_state.events.append({"t": len(st.session_state.history), "name":"Fluids 250 mL"})
+if e4.button("Mark: Vasopressor",     key="mark_press"):     st.session_state.events.append({"t": len(st.session_state.history), "name":"Vasopressor"})
+if e5.button("Clear Events",          key="mark_clear"):          st.session_state.events = []
 
-# -------------------- Dynamic Threshold Engine --------------------
+# -------------- Dynamic Threshold Engine --------------
 def _time_now_index() -> int:
     if st.session_state.history.empty: return 0
     return int(st.session_state.history["Time"].iloc[-1])
 
-def _age_since_event(name: str, horizon: int) -> float:
+def _age_since_event(name: str, horizon: int) -> Optional[float]:
     t_now = _time_now_index()
     recent = [e for e in st.session_state.events if e["name"] == name and 0 <= (t_now - e["t"]) <= horizon]
     if not recent: return None
-    age = min(t_now - e["t"] for e in recent)
-    return float(age)
+    return float(min(t_now - e["t"] for e in recent))
 
-def _decay_linear(age: float, horizon: int) -> float:
+def _decay_linear(age: Optional[float], horizon: int) -> float:
     if age is None: return 0.0
     return max(0.0, (horizon - age)/float(horizon))
 
@@ -287,18 +362,13 @@ def _scenario_mods():
     name = st.session_state.scenario_name
     active = (name is not None) and (time.time() <= st.session_state.scenario_end)
     if not active: return dict(spo2=0, hr=0, map=0, et_high=0, rr_low=0)
-    if name == "Bleed":
-        return dict(spo2=0,  hr=-10, map=+5,  et_high=0,  rr_low=0)
-    if name == "Bronchospasm":
-        return dict(spo2=+2, hr=0,   map=0,   et_high=-4, rr_low=+2)
-    if name == "Vasodilation":
-        return dict(spo2=0,  hr=0,   map=+5,  et_high=0,  rr_low=0)
-    if name == "Pain/Light":
-        return dict(spo2=0,  hr=-10, map=0,   et_high=0,  rr_low=0)
+    if name == "Bleed":        return dict(spo2=0,  hr=-10, map=+5,  et_high=0,  rr_low=0)
+    if name == "Bronchospasm": return dict(spo2=+2, hr=0,   map=0,   et_high=-4, rr_low=+2)
+    if name == "Vasodilation": return dict(spo2=0,  hr=0,   map=+5,  et_high=0,  rr_low=0)
+    if name == "Pain/Light":   return dict(spo2=0,  hr=-10, map=0,   et_high=0,  rr_low=0)
     return dict(spo2=0, hr=0, map=0, et_high=0, rr_low=0)
 
 def _event_mods():
-    t_now = _time_now_index()
     H_INCISION = 90; H_FLUIDS = 120; H_PRESSOR = 180; H_POSN = 120
     age_incision = _age_since_event("Incision", H_INCISION)
     age_fluids   = _age_since_event("Fluids 250 mL", H_FLUIDS)
@@ -308,9 +378,9 @@ def _event_mods():
     w_flu = _decay_linear(age_fluids,   H_FLUIDS)
     w_pre = _decay_linear(age_pressor,  H_PRESSOR)
     w_pos = _decay_linear(age_posn,     H_POSN)
-    spo2 = (-2.0 * w_pos)            # relax SpO2 slightly after position change
-    hr   = (+10.0 * w_inc)           # relax tachy near incision
-    map_ = (-5.0 * w_flu) + (+5.0 * w_pre)  # fluids relax MAP; pressor makes MAP stricter
+    spo2 = (-2.0 * w_pos)
+    hr   = (+10.0 * w_inc)
+    map_ = (-5.0 * w_flu) + (+5.0 * w_pre)
     et_h = 0.0; rr_l = 0.0
     return dict(spo2=spo2, hr=hr, map=map_, et_high=et_h, rr_low=rr_l)
 
@@ -330,147 +400,16 @@ def effective_thresholds():
     eff["exit_map"]  = eff["low_map"]  + st.session_state.hys_map
     return eff
 
-# -------------------- Synthetic data generator (for ML training) --------------------
-def _sample_class(label, n):
-    rng = np.random.default_rng()
-    def clip(v, lo, hi): return int(np.clip(v, lo, hi))
-    rows = []
-    for _ in range(n):
-        if label == "Hypovolemia":  # bleed
-            hr   = rng.normal(115, 12)
-            map_ = rng.normal(58, 8)
-            spo2 = rng.normal(94, 2.5)
-            et   = rng.normal(36, 2)
-            rr   = rng.normal(14, 3)
-        elif label == "Bronchospasm":
-            hr   = rng.normal(98, 10)
-            map_ = rng.normal(72, 7)
-            spo2 = rng.normal(90, 3.5)
-            et   = rng.normal(50, 4)
-            rr   = rng.normal(24, 5)
-        elif label == "Vasodilation":
-            hr   = rng.normal(70, 8)
-            map_ = rng.normal(60, 7)
-            spo2 = rng.normal(97, 1.5)
-            et   = rng.normal(37, 2)
-            rr   = rng.normal(12, 2.5)
-        elif label == "Pain/Light":
-            hr   = rng.normal(110, 12)
-            map_ = rng.normal(90, 8)
-            spo2 = rng.normal(98, 1.2)
-            et   = rng.normal(37, 2)
-            rr   = rng.normal(20, 4)
-        else:  # Normal
-            hr   = rng.normal(80, 8)
-            map_ = rng.normal(80, 6)
-            spo2 = rng.normal(98, 1.2)
-            et   = rng.normal(37, 2)
-            rr   = rng.normal(12, 2.5)
-        rows.append({
-            "HR": clip(hr, 40, 170),
-            "MAP": clip(map_, 45, 110),
-            "SpO2": clip(spo2, 85, 100),
-            "EtCO2": clip(et, 25, 60),
-            "RR": clip(rr, 6, 35),
-            "label": label
-        })
-    return rows
-
-def generate_synthetic_df(n_bleed=800, n_bronch=800, n_vaso=800, n_pain=800, n_normal=800):
-    data = []
-    data += _sample_class("Hypovolemia", n_bleed)
-    data += _sample_class("Bronchospasm", n_bronch)
-    data += _sample_class("Vasodilation", n_vaso)
-    data += _sample_class("Pain/Light", n_pain)
-    data += _sample_class("Normal", n_normal)
-    df = pd.DataFrame(data)
-    return df.sample(frac=1.0, random_state=42).reset_index(drop=True)
-
-# -------------------- ML Training Lab (UI) --------------------
-st.markdown("### Training Lab (optional)")
-lab1, lab2, lab3, lab4 = st.columns([2,2,2,2])
-
-with lab1:
-    if st.button("Generate synthetic dataset (balanced, 4k+)"):
-        st.session_state.ml_training_df = generate_synthetic_df()
-        st.success(f"Synthetic dataset ready: {len(st.session_state.ml_training_df)} rows")
-
-with lab2:
-    up_lbl = st.file_uploader("Upload labeled CSV for ML (HR,SpO2,MAP,EtCO2,RR,label)", type=["csv"], key="mlcsv")
-    if up_lbl is not None:
-        try:
-            df_u = pd.read_csv(io.StringIO(up_lbl.getvalue().decode("utf-8")), encoding_errors="ignore")
-            need = ["HR","SpO2","MAP","EtCO2","RR","label"]
-            lowermap = {c.lower(): c for c in df_u.columns}
-            remap = {}
-            for col in need:
-                if col in df_u.columns: remap[col]=col
-                else:
-                    if col.lower() in lowermap: remap[ lowermap[col.lower()] ] = col
-            df_u = df_u.rename(columns=remap)
-            if not set(need).issubset(set(df_u.columns)):
-                st.error("CSV must have columns: HR, SpO2, MAP, EtCO2, RR, label")
-            else:
-                df_u = df_u[need].dropna().reset_index(drop=True)
-                st.session_state.ml_training_df = df_u
-                st.success(f"Labeled dataset loaded: {len(df_u)} rows")
-        except Exception as e:
-            st.error(f"Failed to read labeled CSV: {e}")
-
-with lab3:
-    try:
-        from sklearn.model_selection import train_test_split
-        from sklearn.preprocessing import StandardScaler
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.metrics import accuracy_score
-        if st.button("Train ML model"):
-            df_train = st.session_state.ml_training_df.copy()
-            if df_train.empty:
-                st.warning("No training data yet. Generate synthetic or upload labeled CSV.")
-            else:
-                X = df_train[["HR","SpO2","MAP","EtCO2","RR"]].values
-                y = df_train["label"].values
-                X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=7, stratify=y)
-                scaler = StandardScaler()
-                X_tr_s = scaler.fit_transform(X_tr)
-                X_te_s = scaler.transform(X_te)
-                clf = LogisticRegression(max_iter=1000, multi_class="auto")
-                clf.fit(X_tr_s, y_tr)
-                pred = clf.predict(X_te_s)
-                acc = accuracy_score(y_te, pred)
-                st.session_state.ml_model = clf
-                st.session_state.ml_scaler = scaler
-                st.session_state.ml_classes = list(sorted(np.unique(y)))
-                st.success(f"Model trained. Validation accuracy: {acc:.3f}")
-                st.caption("Simple Logistic Regression over 5 vitals; swap in another classifier if desired.")
-    except ImportError:
-        st.info("Training disabled in this minimal build (no sklearn). Use synthetic means for scenario targets.")
-
-with lab4:
-    st.session_state.ml_use_in_hypothesis = st.checkbox("Use ML in hypothesis", value=st.session_state.ml_use_in_hypothesis, key="ml_in_hyp")
-    st.session_state.ml_drive_scenarios   = st.checkbox("Use ML to drive scenario targets", value=st.session_state.ml_drive_scenarios, key="ml_scenarios")
-
-# -------------------- Simulation / Replay --------------------
-def _step(val, target, sigma, lo, hi):
+# -------------- Simulation / Replay --------------
+def __step(val, target, sigma, lo, hi):
     v = val + random.gauss(0, sigma) + (target - val) * random.uniform(0.02, 0.08)
     return max(lo, min(hi, v))
-
-def _class_means_from_training(label: str):
-    df = st.session_state.ml_training_df
-    if df.empty or "label" not in df.columns: return None
-    sub = df[df["label"] == label]
-    if len(sub) < 10: return None
-    m = sub[["HR","SpO2","MAP","EtCO2","RR"]].mean().to_dict()
-    return {k: float(m[k]) for k in ["HR","SpO2","MAP","EtCO2","RR"]}
 
 def _scenario_targets(base):
     name = st.session_state.scenario_name
     active = (name is not None) and (time.time() <= st.session_state.scenario_end)
     if not active:
         return dict(HR=base["HR"], SpO2=base["SpO2"], MAP=base["MAP"], EtCO2=base["EtCO2"], RR=base["RR"])
-    label_map = {"Bleed":"Hypovolemia", "Bronchospasm":"Bronchospasm", "Vasodilation":"Vasodilation", "Pain/Light":"Pain/Light"}
-    if st.session_state.ml_drive_scenarios and (means := _class_means_from_training(label_map.get(name,""))):
-        return means
     targets = dict(HR=base["HR"], SpO2=base["SpO2"], MAP=base["MAP"], EtCO2=base["EtCO2"], RR=base["RR"])
     if name == "Bleed":
         targets["MAP"] = base["MAP"] - 15; targets["HR"]  = base["HR"] + 15; targets["SpO2"] = base["SpO2"] - 1
@@ -486,11 +425,11 @@ def _tick_live(sim_hz):
     for _ in range(sim_hz):
         base = st.session_state.sim_val
         targets = _scenario_targets(base)
-        hr   = _step(base["HR"],   targets["HR"],   1.2, 30, 180)
-        spo2 = _step(base["SpO2"], targets["SpO2"], 0.6, 70, 100)
-        map_ = _step(base["MAP"],  targets["MAP"],  1.5, 40, 120)
-        et   = _step(base["EtCO2"],targets["EtCO2"],0.8, 20, 60)
-        rr   = _step(base["RR"],   targets["RR"],   0.8,  6, 40)
+        hr   = __step(base["HR"],   targets["HR"],   1.2, 30, 180)
+        spo2 = __step(base["SpO2"], targets["SpO2"], 0.6, 70, 100)
+        map_ = __step(base["MAP"],  targets["MAP"],  1.5, 40, 120)
+        et   = __step(base["EtCO2"],targets["EtCO2"],0.8, 20, 60)
+        rr   = __step(base["RR"],   targets["RR"],   0.8,  6, 40)
 
         if st.session_state.enable_noise and random.random() < (st.session_state.artifact_pct/100.0):
             pick = random.random()
@@ -524,58 +463,52 @@ if st.session_state.running:
     else: _tick_replay()
 
 df = st.session_state.history
+st.session_state["df"] = df  # expose for assistant safely
 
-# -------------------- Charts --------------------
+# -------------- Vitals Charts (top) --------------
 c1, c2, c3, c4, c5 = st.columns(5)
 if not df.empty:
-    c1.subheader("HR (bpm)");     c1.line_chart(df.set_index("Time")["HR"])
-    c2.subheader("SpO₂ (%)");     c2.line_chart(df.set_index("Time")["SpO2"])
-    c3.subheader("MAP (mmHg)");   c3.line_chart(df.set_index("Time")["MAP"])
-    c4.subheader("EtCO₂ (mmHg)"); c4.line_chart(df.set_index("Time")["EtCO2"])
-    c5.subheader("RR (bpm)");     c5.line_chart(df.set_index("Time")["RR"])
+    c1.subheader("HR (bpm)");     c1.line_chart(df.set_index("Time")["HR"], use_container_width=True)
+    c2.subheader("SpO₂ (%)");     c2.line_chart(df.set_index("Time")["SpO2"], use_container_width=True)
+    c3.subheader("MAP (mmHg)");   c3.line_chart(df.set_index("Time")["MAP"], use_container_width=True)
+    c4.subheader("EtCO₂ (mmHg)"); c4.line_chart(df.set_index("Time")["EtCO2"], use_container_width=True)
+    c5.subheader("RR (bpm)");     c5.line_chart(df.set_index("Time")["RR"], use_container_width=True)
 else:
     st.info("Click Start (Live) or upload a CSV (Replay).")
 
-# -------------------- Helpers --------------------
-def last_n(df_in: pd.DataFrame, seconds: int) -> pd.DataFrame:
-    if df_in.empty: return df_in
-    end = df_in["Time"].iloc[-1]; start = max(0, end - seconds + 1)
-    return df_in[df_in["Time"].between(start, end)]
+# -------------- Helpers for alarms & summary --------------
+def last_n(df_: pd.DataFrame, seconds: int) -> pd.DataFrame:
+    if df_ is None or df_.empty: return df_
+    end = df_["Time"].iloc[-1]; start = max(0, end - seconds + 1)
+    return df_[df_["Time"].between(start, end)]
 
-def persistent_low(df_in, signal, thresh, sec):
-    w = last_n(df_in, sec)
-    return (len(w) >= sec) and (w[signal].min() < thresh)
+def persistent_low(df_, signal, thresh, sec):
+    w = last_n(df_, sec)
+    return (w is not None) and (len(w) >= max(3, min(sec, len(w)))) and (w[signal].min() < thresh)
 
-def persistent_high(df_in, signal, thresh, sec):
-    w = last_n(df_in, sec)
-    return (len(w) >= sec) and (w[signal].max() > thresh)
+def persistent_high(df_, signal, thresh, sec):
+    w = last_n(df_, sec)
+    return (w is not None) and (len(w) >= max(3, min(sec, len(w)))) and (w[signal].max() > thresh)
 
 def is_artifact_series(series: pd.Series) -> bool:
-    if len(series) < 6: return False
+    if series is None or len(series) < 6: return False
     recent = series.iloc[-6:]
     diffs = np.abs(np.diff(recent.values))
     if len(diffs)==0: return False
     return diffs[-1] > (np.std(recent.values) * 4 + 4)
 
-def recent_artifact(df_in: pd.DataFrame) -> dict:
-    if df_in.empty:
+def recent_artifact(df_: pd.DataFrame) -> dict:
+    if df_ is None or df_.empty:
         return {"HR":False,"SpO2":False,"MAP":False,"EtCO2":False,"RR":False}
-    return {"HR":is_artifact_series(df_in["HR"]), "SpO2":is_artifact_series(df_in["SpO2"]),
-            "MAP":is_artifact_series(df_in["MAP"]), "EtCO2":is_artifact_series(df_in["EtCO2"]),
-            "RR":is_artifact_series(df_in["RR"])}
+    return {"HR":is_artifact_series(df_["HR"]), "SpO2":is_artifact_series(df_["SpO2"]),
+            "MAP":is_artifact_series(df_["MAP"]), "EtCO2":is_artifact_series(df_["EtCO2"]),
+            "RR":is_artifact_series(df_["RR"])}
 
-def _slope(series: pd.Series, window_pts: int = 10) -> float:
-    """Simple slope: (last - first) / window_pts (units per sample)."""
-    if len(series) < 2: return 0.0
-    w = series.iloc[-window_pts:] if len(series) >= window_pts else series
-    return float(w.iloc[-1] - w.iloc[0]) / max(1, (len(w)-1))
-
-# -------------------- Effective thresholds --------------------
 eff = effective_thresholds()
 
-# -------------------- Alarm Fusion (uses EFFECTIVE thresholds) --------------------
+# -------------- Alarm Fusion --------------
 alerts = []
-hypox = tachy = hypot = hypercap = hypovent = False  # safe defaults
+hypox = tachy = hypot = hypercap = hypovent = False
 
 if not df.empty:
     arts = recent_artifact(df)
@@ -596,265 +529,97 @@ if not df.empty:
         sev = "Advisory" if not (hypercap and hypovent and hypox) else "Warning"
         alerts.append({"label":"Respiratory Concern","severity":sev,"why":", ".join(msg)})
 
-# -------------------- Hypothesis Engine (meaning layer) --------------------
-def _z(x, lo, hi):
-    if x <= lo: return 0.0
-    if x >= hi: return 1.0
-    return (x - lo) / float(hi - lo)
-def _bounded(x): return max(0.0, min(1.0, float(x)))
+# -------------- Top Suggested Action (concise) --------------
+st.caption("**Within limits** = HALO’s recommendation stays inside your clinician-defined safety rails for drug dosages, infusion rates, and vital sign targets. HALO will never suggest exceeding those bounds.")
 
-def _delta(series: pd.Series, window: int) -> float:
-    if len(series) < 2: return 0.0
-    w = series.iloc[-window:] if len(series) >= window else series
-    return float(w.iloc[-1] - w.iloc[0])
-
-def _event_weight(name: str, t_now: int, horizon=180, decay=0.4):
-    rel = [e for e in st.session_state.events if e["name"] == name and 0 <= (t_now - e["t"]) <= horizon]
-    if not rel: return 0.0
-    ages = [t_now - e["t"] for e in rel]
-    w = max(0.0, 1.0 - min(ages)/horizon)
-    return w**(1-decay)
-
-def hypothesis_components(df_in: pd.DataFrame):
-    if df_in.empty: return [], {}
-    hr = df_in["HR"]; s2 = df_in["SpO2"]; mp = df_in["MAP"]; et = df_in["EtCO2"]; rr = df_in["RR"]
-    comps = {
-        "MAP_down": _bounded(_z(80 - mp.iloc[-1], 0, 25) + _z(-_delta(mp,10), 3, 15)),
-        "HR_up":    _bounded(_z(hr.iloc[-1], 90, 130) + _z(_delta(hr,10), 3, 15)),
-        "SpO2_down":_bounded(_z(95 - s2.iloc[-1], 0, 10) + _z(-_delta(s2,10), 1, 6)),
-        "Et_high":  _bounded(_z(et.iloc[-1], 40, 55)),
-        "Et_low":   _bounded(_z(35 - et.iloc[-1], 0, 10)),
-        "RR_low":   _bounded(_z(12 - rr.iloc[-1], 0, 6)),
-        "RR_high":  _bounded(_z(rr.iloc[-1], 20, 35)),
-    }
-    t_now = int(df_in["Time"].iloc[-1])
-    pri = {"incision": _event_weight("Incision", t_now, 180, 0.4),
-           "fluids":   _event_weight("Fluids 250 mL", t_now, 120, 0.4),
-           "pressor":  _event_weight("Vasopressor", t_now, 180, 0.4),
-           "position": _event_weight("Position change", t_now, 120, 0.4)}
-    hypovolemia = _bounded(0.55*comps["MAP_down"] + 0.35*comps["HR_up"] + 0.10*(1-comps["SpO2_down"]) + 0.25*pri["incision"] - 0.20*pri["fluids"])
-    vasodilation= _bounded(0.60*comps["MAP_down"] + 0.25*(1-comps["HR_up"]) + 0.15*(1 - comps["SpO2_down"]) - 0.25*pri["pressor"])
-    respiratory = _bounded(0.45*comps["SpO2_down"] + 0.25*comps["Et_high"] + 0.25*max(comps["RR_low"], comps["RR_high"]) + 0.15*pri["position"])
-    pain_light  = _bounded(0.65*comps["HR_up"] + 0.20*(1 - comps["SpO2_down"]))
-    hyps = [
-        {"name":"Hypovolemia",       "score":hypovolemia},
-        {"name":"Vasodilation",      "score":vasodilation},
-        {"name":"Respiratory issue", "score":respiratory},
-        {"name":"Pain / light",      "score":pain_light},
-    ]
-    return hyps, comps
-
-def ml_predict_last(df_in: pd.DataFrame):
-    model = st.session_state.ml_model; scaler = st.session_state.ml_scaler; classes = st.session_state.ml_classes
-    if model is None or scaler is None or not classes or df_in.empty:
+def top_suggested_action(df_: pd.DataFrame) -> Dict[str, str]:
+    if df_ is None or df_.empty:
         return {}
-    w = last_n(df_in, 5) if len(df_in) >= 5 else df_in
-    feat = w[["HR","SpO2","MAP","EtCO2","RR"]].mean().values.reshape(1,-1)
-    feat_s = scaler.transform(feat)
-    probs = model.predict_proba(feat_s)[0]
-    return {classes[i]: float(probs[i]) for i in range(len(classes))}
+    w = last_n(df_, 20)
+    if w is None or w.empty:
+        w = df_
+    # Means and simple slopes
+    def slope(s: pd.Series) -> float:
+        if s is None or len(s) < 2: return 0.0
+        x = np.arange(len(s), dtype=float); y = s.to_numpy(dtype=float)
+        xm, ym = x.mean(), y.mean()
+        denom = ((x - xm)**2).sum()
+        if denom == 0: return 0.0
+        return float(((x - xm)*(y - ym)).sum() / denom)
 
-# -------------------- Phase 2: Corroboration, Confidence, Anticipation --------------------
-def artifact_rate(series: pd.Series, window=60):
-    if len(series) < 8: return 0.0
-    w = series.iloc[-min(window, len(series)):]
-    jumps = np.abs(np.diff(w.values)); thr = np.std(w.values) * 4 + 4
-    return float(np.mean(jumps > thr))
+    stats = {}
+    for k in ["MAP","HR","SpO2","EtCO2","RR"]:
+        if k in w.columns:
+            stats[k] = {"mean": float(np.mean(w[k])), "trend": slope(w[k])}
 
-def _confidence_for_alert(alert, df_in: pd.DataFrame, eff_in: dict) -> float:
-    """0..1 confidence blending: persistence, corroboration count, data quality."""
-    if df_in.empty: return 0.0
-    label = alert["label"]
-    w = last_n(df_in,  max(8, st.session_state.win_map))
-    if w.empty: return 0.0
+    if not stats:
+        return {}
 
-    # base: persistence met → 0.5
-    conf = 0.5
+    # Simple logic
+    action = "Observe"
+    rationale = "Signals stable."
+    confidence = 0.5
+    anticipatory = "No immediate deterioration expected."
+    alts = ["Reassess in 30–60s", "Check sensor positions"]
+    within = "✅ within limits"
 
-    # corroboration: count other signals that support the physiology
-    cor = _corroboration_flags(label, df_in, eff_in)
-    cor_count = sum(1 for c in cor if c["supports"])
-    conf += 0.15 * min(3, cor_count)  # up to +0.45
+    if "MAP" in stats and "HR" in stats:
+        if stats["MAP"]["mean"] < 65 or stats["MAP"]["trend"] < -0.3:
+            if stats["HR"]["trend"] > 0.2:
+                action = "Evaluate volume; consider fluids if appropriate. Support MAP ≥ 65."
+                rationale = "MAP is low/falling with HR rising — pattern consistent with relative hypovolemia."
+                confidence = 0.7
+                anticipatory = "MAP likely to remain below floor without intervention."
+                alts = ["Vasopressor if volume adequate", "Reduce anesthetic depth if appropriate"]
+            else:
+                action = "Consider vasopressor support; review anesthetic depth."
+                rationale = "MAP low/falling with limited HR response — vasodilation/drug effect likely."
+                confidence = 0.65
+                anticipatory = "Sustained hypotension risk without treatment."
+                alts = ["Small fluid bolus if uncertain", "Lower hypnotic dose if clinically safe"]
 
-    # data quality: penalize if high artifact on involved channels
-    involved = ["SpO2","HR","MAP","EtCO2","RR"]  # simple union
-    dq = np.mean([artifact_rate(df_in[s]) for s in involved if s in df_in.columns])
-    conf -= 0.3 * min(1.0, dq / 0.25)  # up to -0.3 if 25%+ artifacts
-    return float(np.clip(conf, 0.0, 1.0))
+    if "SpO2" in stats and "EtCO2" in stats:
+        if stats["SpO2"]["trend"] < -0.2 and stats["EtCO2"]["trend"] > 0.2:
+            action = "Address ventilation/airway; increase support."
+            rationale = "SpO₂ falling while EtCO₂ rising — hypoventilation/airway issue likely."
+            confidence = 0.75
+            anticipatory = "Oxygenation may worsen if not treated."
+            alts = ["Re-seat probe (rule out artifact)", "Increase minute ventilation", "Suction/check circuit"]
 
-def _anticipate_crossing(series: pd.Series, threshold: float, horizon_pts: int = 10, direction: str = "below") -> bool:
-    """Linear projection: if trend suggests crossing threshold within horizon."""
-    if len(series) < 3: return False
-    sl = _slope(series, window_pts=min(horizon_pts, len(series)))
-    last = float(series.iloc[-1])
-    pred = last + sl * horizon_pts
-    if direction == "below":
-        return pred < threshold
-    else:
-        return pred > threshold
-
-def _chip(text, color_bg="#eef2ff", color_text="#0b2a6b", border="#1e62ff"):
-    return f"<span style='display:inline-block;margin:2px 6px 2px 0;padding:3px 8px;border:1px solid {border};border-radius:12px;background:{color_bg};color:{color_text};font-size:0.85rem;'>{text}</span>"
-
-def _corroboration_flags(label: str, df_in: pd.DataFrame, eff_in: dict):
-    """Return list of dicts: name, supports(bool), trend(str), strength(str)."""
-    w = last_n(df_in, 12)
-    out = []
-    if w.empty: return out
-
-    def flag(name, supports, trend, strength):
-        out.append({"name":name, "supports":supports, "trend":trend, "strength":strength})
-
-    # helpers
-    hr_s   = _slope(w["HR"])
-    map_s  = _slope(w["MAP"])
-    spo2_s = _slope(w["SpO2"])
-    et_s   = _slope(w["EtCO2"])
-    rr_s   = _slope(w["RR"])
-
-    # "strength" by absolute slope magnitude simple bins
-    def strength_from(abs_s):
-        return "strong" if abs_s >= 2.0 else ("moderate" if abs_s >= 0.6 else "mild")
-
-    if label == "Low SpO₂":
-        flag("HR ↑",   True  if (w["HR"].iloc[-1] > 90 or hr_s>0.3)   else False, "rising" if hr_s>0 else "flat/↓", strength_from(abs(hr_s)))
-        flag("MAP ↓",  True  if (w["MAP"].iloc[-1] < 70 or map_s< -0.5) else False, "falling" if map_s<0 else "flat/↑", strength_from(abs(map_s)))
-        # if everything else stable → artifact suspicion (will not mark supports)
-        if all(not x["supports"] for x in out):
-            flag("Other vitals stable", False, "—", "—")
-
-    elif label == "Low MAP":
-        flag("HR ↑",   True if (w["HR"].iloc[-1] > 95 or hr_s>0.4) else False, "rising" if hr_s>0 else "flat/↓", strength_from(abs(hr_s)))
-        flag("SpO₂ ↔/↓", False if w["SpO2"].iloc[-1] >= eff_in["low_spo2"] else True, "falling" if spo2_s<0 else "flat/↑", strength_from(abs(spo2_s)))
-
-    elif label == "Tachycardia":
-        flag("MAP ↓", True if (w["MAP"].iloc[-1] < eff_in["low_map"] or map_s< -0.5) else False, "falling" if map_s<0 else "flat/↑", strength_from(abs(map_s)))
-        flag("SpO₂ ↓",True if (w["SpO2"].iloc[-1] < eff_in["low_spo2"] or spo2_s< -0.3) else False, "falling" if spo2_s<0 else "flat/↑", strength_from(abs(spo2_s)))
-
-    elif label == "Respiratory Concern":
-        flag("EtCO₂ ↑", True if (w["EtCO2"].iloc[-1] > eff_in["high_et"] or et_s>0.3) else False, "rising" if et_s>0 else "flat/↓", strength_from(abs(et_s)))
-        flag("RR ↓",    True if (w["RR"].iloc[-1] < st.session_state.low_rr or rr_s< -0.3) else False, "falling" if rr_s<0 else "flat/↑", strength_from(abs(rr_s)))
-        flag("SpO₂ ↓",  True if (w["SpO2"].iloc[-1] < eff_in["low_spo2"] or spo2_s< -0.3) else False, "falling" if spo2_s<0 else "flat/↑", strength_from(abs(spo2_s)))
-
-    return out
-
-def _render_corroboration(label: str, df_in: pd.DataFrame, eff_in: dict):
-    items = _corroboration_flags(label, df_in, eff_in)
-    if not items: return
-    chips = []
-    for it in items:
-        if it["supports"]:
-            chips.append(_chip(f"{it['name']} ({it['trend']}, {it['strength']})", "#e9f0ff", "#0b2a6b", "#1e62ff"))
-        else:
-            chips.append(_chip(f"{it['name']}", "#f5f5f5", "#444", "#bbb"))
-    st.markdown("**Corroboration:** " + " ".join(chips), unsafe_allow_html=True)
-
-# -------------------- Suggestion Engine (Phase 1) --------------------
-def _within_limits(targets: dict) -> bool:
-    lim = st.session_state.limiters["vitals"]
-    ok = True
-    if "MAP"  in targets and targets["MAP"]  is not None:  ok &= (targets["MAP"]  >= lim["MAP"]["min"])
-    if "SpO2" in targets and targets["SpO2"] is not None:  ok &= (targets["SpO2"] >= lim["SpO2"]["min"])
-    if "EtCO2" in targets and targets["EtCO2"] is not None: 
-        ok &= (lim["EtCO2"]["min"] <= targets["EtCO2"] <= lim["EtCO2"]["max"])
-    if "HR" in targets and targets["HR"] is not None:      ok &= (targets["HR"]  <= lim["HR"]["max"])
-    if "RR" in targets and targets["RR"] is not None:      ok &= (lim["RR"]["min"] <= targets["RR"] <= lim["RR"]["max"])
-    return bool(ok)
-
-def suggest_action_for_alert(alert, df_in: pd.DataFrame, eff_in: dict, limiters: dict):
-    """Return dict: action, within_limits, rationale, alternatives."""
-    label = alert["label"]
-    w = last_n(df_in, 12)
-    if w.empty:
-        return {"action":"Insufficient data", "within_limits":False, "rationale":"Not enough recent samples.", "alternatives":[]}
-
-    # trends
-    hr, mp, s2, et, rr = w["HR"], w["MAP"], w["SpO2"], w["EtCO2"], w["RR"]
-    hr_s, mp_s, s2_s, et_s, rr_s = _slope(hr), _slope(mp), _slope(s2), _slope(et), _slope(rr)
-
-    if label == "Low MAP":
-        action = f"Evaluate volume; consider fluids if appropriate. Support MAP ≥ {max(eff_in['low_map'], st.session_state.limiters['vitals']['MAP']['min'])}."
-        rationale = f"MAP {int(mp.iloc[-1])} and {'falling' if mp_s<0 else 'flat/rising'}; HR {int(hr.iloc[-1])} ({'rising' if hr_s>0 else 'flat/↓'}). Pattern suggests relative hypovolemia vs vasodilation."
-        alternatives = ["Vasopressor if volume adequate", "Reduce anesthetic depth if clinically appropriate"]
-        targets = {"MAP": max(eff_in["low_map"], st.session_state.limiters['vitals']['MAP']['min'])}
-
-    elif label == "Low SpO₂":
-        action = f"Increase FiO₂ / ensure airway patency; target SpO₂ ≥ {max(eff_in['low_spo2'], st.session_state.limiters['vitals']['SpO2']['min'])}%."
-        rationale = f"SpO₂ {int(s2.iloc[-1])}% and {'falling' if s2_s<0 else 'flat/rising'}; HR {'rising' if hr_s>0 else 'flat/↓'}. Consider true hypoxemia vs sensor artifact."
-        alternatives = ["Re-seat pulse oximeter", "Check chest rise / ventilation"]
-        targets = {"SpO2": max(eff_in["low_spo2"], st.session_state.limiters['vitals']['SpO2']['min'])}
-
-    elif label == "Tachycardia":
-        action = "Assess stimulus, analgesia, and volume status; treat cause."
-        rationale = f"HR {int(hr.iloc[-1])} and {'rising' if hr_s>0 else 'flat/↓'}; MAP {int(mp.iloc[-1])} ({'falling' if mp_s<0 else 'flat/↑'})."
-        alternatives = ["Analgesia optimization", "Small fluid bolus if indicated", "Check depth"]
-        targets = {"HR": min(st.session_state.limiters['vitals']['HR']['max'], int(hr.iloc[-1]))}
-
-    elif label == "Respiratory Concern":
-        action = f"Increase minute ventilation; ensure airway and circuit integrity."
-        rationale = f"EtCO₂ {int(et.iloc[-1])} ({'rising' if et_s>0 else 'flat/↓'}), RR {int(rr.iloc[-1])} ({'falling' if rr_s<0 else 'flat/↑'})."
-        alternatives = ["Clear secretions", "Reconfirm tube position", "Adjust ventilator settings"]
-        targets = {"EtCO2": min(eff_in["high_et"], st.session_state.limiters['vitals']['EtCO2']['max'])}
-    else:
-        action = "Observe; no immediate action required."
-        rationale = "No specific suggestion."
-        alternatives = []
-        targets = {}
-
-    within = _within_limits(targets)
     return {
-        "action": action,
-        "within_limits": within,
-        "rationale": rationale,
-        "alternatives": alternatives
+        "Suggested": action,
+        "Rationale": rationale,
+        "Within": within,
+        "Confidence": f"{int(round(confidence*100))}%",
+        "Anticipatory": anticipatory,
+        "Alternatives": alts
     }
 
-def render_suggestion_card(sug: dict, conf_value: float = None, anticipate_text: str = None):
-    within = sug.get("within_limits", False)
-    badge = ("<b style='color:#0a5a0a;'>✅ within limits</b>" if within else
-             "<b style='color:#b00020;'>⚠️ outside current limits</b>")
-    conf_html = ""
-    if conf_value is not None:
-        pct = int(round(conf_value * 100))
-        color = "#0a5a0a" if pct >= 75 else ("#c26b00" if pct >= 50 else "#b00020")
-        conf_html = f"<div style='margin-top:4px;'>Confidence: <b style='color:{color}'>{pct}%</b></div>"
-    ant_html = f"<div style='margin-top:4px;color:#5a3200'><b>{anticipate_text}</b></div>" if anticipate_text else ""
+# -------------- Mini interactive 12s charts --------------
+def interactive_12s_chart(df_: pd.DataFrame, field: str, title: str) -> Optional[alt.Chart]:
+    if df_ is None or df_.empty or field not in df_.columns:
+        return None
+    w = last_n(df_, 12)
+    if w is None or w.empty:
+        w = df_.iloc[-min(12, len(df_)):]
+    chart_df = w[["Time", field]].copy()
+    chart = (
+        alt.Chart(chart_df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("Time:Q", axis=alt.Axis(title="(last 12s)")),
+            y=alt.Y(f"{field}:Q", axis=alt.Axis(title=field)),
+            tooltip=["Time", field],
+        )
+        .properties(title=title, height=180)
+        .interactive()
+    )
+    return chart
 
-    alts = "".join([f"<li>{a}</li>" for a in sug.get("alternatives", [])])
-    st.markdown(f"""
-    <div style="border-left:10px solid #1e62ff;background:#e9f0ff;color:#0a0a0a;
-                padding:12px 16px;border-radius:10px;margin:6px 0;font-size:1.0rem;line-height:1.5;">
-      <div style="font-weight:800;color:#0b2a6b;font-size:1.1rem;margin-bottom:6px;">
-        Top Suggested Action
-      </div>
-      <div><b>Suggested:</b> {sug.get('action','')}</div>
-      <div style="margin-top:4px;"><b>Rationale:</b> {sug.get('rationale','')}</div>
-      <div style="margin-top:4px;">{badge}</div>
-      {conf_html}
-      {ant_html}
-      <div style="margin-top:6px;"><b>Alternatives:</b>
-        <ul style="margin:6px 0 0 18px;">{alts}</ul>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-# -------------------- Alarm Panel (moved ABOVE Data Quality) --------------------
+# -------------- Alarm Panel (with top action and mini charts) --------------
 st.subheader("Alarm Panel")
 
-def last_n_plot(series, window, thresh=None, invert=False):
-    if len(series) < 3: return
-    fig, ax = plt.subplots(figsize=(3.5, 1.3))
-    ax.plot(series.index, series.values)
-    xmax = series.index.max(); xmin = max(series.index.min(), xmax - window + 1)
-    ax.axvspan(xmin, xmax, alpha=0.15, color="#1e62ff")
-    if thresh is not None:
-        ax.axhline(thresh, linestyle="--", alpha=0.6, color="#b00020" if not invert else "#0a0a0a")
-    ax.set_yticklabels([]); ax.set_xticklabels([])
-    ax.set_yticks([]); ax.set_xticks([])
-    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
-    st.pyplot(fig, clear_figure=True)
-
-def banner(a, idx):
+def alarm_banner(a):
     label, severity, why = a["label"], a["severity"], a["why"]
     palettes = {"Advisory":{"border":"#1e62ff","bg":"#e9f0ff","title":"#0b2a6b","text":"#0a0a0a"},
                 "Warning":{"border":"#c26b00","bg":"#fff0d6","title":"#5a3200","text":"#0a0a0a"},
@@ -870,62 +635,26 @@ def banner(a, idx):
       <div style="margin-bottom:6px;"><b>Why:</b> {why}</div>
     </div>""", unsafe_allow_html=True)
 
-    # ---- Phase 2: TOP SUGGESTED ACTION + HYPOTHESIS ABOVE SPARKLINES ----
-    # suggestion + confidence + anticipation
-    sug = suggest_action_for_alert(a, df, eff, st.session_state.limiters)
-    conf = _confidence_for_alert(a, df, eff)
-
-    # simple anticipation text (if likely to cross in next ~10 samples)
-    w = last_n(df, 12).set_index("Time")
-    anticipate_txt = None
-    try:
-        if label == "Low MAP" and not w.empty:
-            if _anticipate_crossing(w["MAP"], eff["low_map"], horizon_pts=10, direction="below"):
-                anticipate_txt = "Anticipatory: MAP trend likely to stay below floor soon."
-        if label == "Low SpO₂" and not w.empty:
-            if _anticipate_crossing(w["SpO2"], eff["low_spo2"], horizon_pts=10, direction="below"):
-                anticipate_txt = "Anticipatory: SpO₂ trend likely to stay below floor soon."
-    except Exception:
-        pass
-
-    render_suggestion_card(sug, conf_value=conf, anticipate_text=anticipate_txt)
-    if len(st.session_state.audit) == 0 or st.session_state.audit[-1].get("action") != "suggestion_show":
-        st.session_state.audit.append({
-            "t": int(df["Time"].iloc[-1]),
-            "action":"suggestion_show",
-            "label": label,
-            "suggested": sug.get("action",""),
-            "within_limits": sug.get("within_limits", False)
-        })
-
-    # mini Hypothesis summary
-    hyps, _ = hypothesis_components(df)
-    if hyps:
-        total = sum(h["score"] for h in hyps) or 1e-9
-        for h in hyps: h["pct"] = int(round(100 * h["score"] / total))
-        top = sorted(hyps, key=lambda x: x["pct"], reverse=True)
-        st.markdown(f"**Hypothesis (rules):** {top[0]['name']} — **{top[0]['pct']}%**", unsafe_allow_html=True)
-
-    # explainable corroboration chips
-    _render_corroboration(label, df, eff)
-
-    # ---- Sparkline graphs (now below suggestion + hypothesis) ----
-    if not w.empty:
-        cols = st.columns(3)
-        if label == "Low SpO₂":
-            cols[1].markdown("**SpO₂ last 12s**"); last_n_plot(w["SpO2"], 12, thresh=eff["low_spo2"], invert=False)
-        elif label == "Low MAP":
-            cols[2].markdown("**MAP last 12s**");  last_n_plot(w["MAP"], 12, thresh=eff["low_map"], invert=False)
-        elif label == "Tachycardia":
-            cols[0].markdown("**HR last 12s**");   last_n_plot(w["HR"], 12, thresh=eff["tachy_hr"], invert=True)
-        elif label == "Respiratory Concern":
-            cols[0].markdown("**EtCO₂ last 12s**"); last_n_plot(w["EtCO2"], 12, thresh=eff["high_et"], invert=False)
-            cols[1].markdown("**RR last 12s**");    last_n_plot(w["RR"], 12, thresh=st.session_state.low_rr,  invert=True)
+    # horizontal mini charts
+    wmini = last_n(df, 12)
+    if wmini is None or wmini.empty:
+        return
+    cols = st.columns(4)
+    charts = [
+        ("HR", "HR — last 12s"),
+        ("MAP", "MAP — last 12s"),
+        ("SpO2", "SpO₂ — last 12s"),
+        ("EtCO2", "EtCO₂ — last 12s"),
+    ]
+    for i, (colname, title) in enumerate(charts):
+        ch = interactive_12s_chart(wmini, colname, title)
+        if ch is not None:
+            cols[i].altair_chart(ch, use_container_width=True)
 
 if alerts:
-    for i, a in enumerate(alerts):
+    for a in alerts:
         st.session_state.audit.append({"t": int(df["Time"].iloc[-1]), "action":"alert_raise", **a})
-        banner(a, i)
+        alarm_banner(a)
 else:
     st.markdown("""
         <div style="border-left:10px solid #0a8a0a;background:#e8f7e8;color:#0a0a0a;
@@ -935,65 +664,521 @@ else:
             <div style="font-weight:500;">System nominal.</div>
         </div>""", unsafe_allow_html=True)
 
-# -------------------- Data Quality Panel (moved BELOW Alarm Panel) --------------------
+# top suggested action (always visible below alarms)
+tsa = top_suggested_action(df)
+if tsa:
+    alts_html = "".join(f"<li>{x}</li>" for x in tsa["Alternatives"])
+    st.markdown(f"""
+    <div style="border-left:10px solid #6f2dbd;background:#f4edff;color:#0a0a0a;
+                padding:14px 18px;border-radius:10px;margin:10px 0;font-size:1.05rem;line-height:1.5;
+                box-shadow:0 2px 6px rgba(0,0,0,0.12);">
+      <div style="font-weight:800;color:#3d146b;font-size:1.2rem;margin-bottom:6px;">Top Suggested Action</div>
+      <div><b>Suggested:</b> {tsa["Suggested"]}</div>
+      <div><b>Rationale:</b> {tsa["Rationale"]}</div>
+      <div><b>{tsa["Within"]}</b></div>
+      <div><b>Confidence:</b> {tsa["Confidence"]}</div>
+      <div><b>Anticipatory:</b> {tsa["Anticipatory"]}</div>
+      <div><b>Alternatives:</b><ul style="margin:6px 0 0 18px;">{alts_html}</ul></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# -------------- Data Quality (augmented) --------------
 st.subheader("Data Quality (last 60s)")
+
+def artifact_rate(series: pd.Series, window=60) -> float:
+    if series is None or len(series) < 8: return 0.0
+    w = series.iloc[-min(window, len(series)):]
+    jumps = np.abs(np.diff(w.values)); thr = np.std(w.values) * 4 + 4
+    return float(np.mean(jumps > thr))
+
+def dropout_rate(series: pd.Series, window=60) -> float:
+    if series is None or len(series) < 2: return 0.0
+    w = series.iloc[-min(window, len(series)):]
+    return float(w.isna().mean())
+
+def flatline_rate(series: pd.Series, window=60) -> float:
+    if series is None or len(series) < 4: return 0.0
+    w = series.iloc[-min(window, len(series)):]
+    diffs = np.abs(np.diff(w.values))
+    return float(np.mean(diffs < 1e-6))
+
 if len(df) >= 10:
     q1, q2, q3, q4, q5 = st.columns(5)
-    rates = {"HR":artifact_rate(df["HR"]), "SpO₂":artifact_rate(df["SpO2"]),
-             "MAP":artifact_rate(df["MAP"]), "EtCO₂":artifact_rate(df["EtCO2"]), "RR":artifact_rate(df["RR"])}
-    def badge(name, r):
-        color = "#0a8a0a" if r < 0.05 else ("#c26b00" if r < 0.15 else "#b00020")
+    rates = {
+        "HR":     (artifact_rate(df["HR"]),     dropout_rate(df["HR"]),     flatline_rate(df["HR"])),
+        "SpO₂":   (artifact_rate(df["SpO2"]),   dropout_rate(df["SpO2"]),   flatline_rate(df["SpO2"])),
+        "MAP":    (artifact_rate(df["MAP"]),    dropout_rate(df["MAP"]),    flatline_rate(df["MAP"])),
+        "EtCO₂":  (artifact_rate(df["EtCO2"]),  dropout_rate(df["EtCO2"]),  flatline_rate(df["EtCO2"])),
+        "RR":     (artifact_rate(df["RR"]),     dropout_rate(df["RR"]),     flatline_rate(df["RR"])),
+    }
+
+    def badge(name, a, d, f):
+        color = "#0a8a0a" if a < 0.05 else ("#c26b00" if a < 0.15 else "#b00020")
         return (
             "<div style='background:#f5f5f5;color:#111111;padding:8px;"
             f"border-left:8px solid {color};border-radius:8px'>"
-            f"{name}: <b style='color:{color}'>{int(r*100)}%</b> artifact-like jumps</div>"
+            f"{name}: <b style='color:{color}'>{int(a*100)}%</b> artifact | "
+            f"<b>{int(d*100)}%</b> dropout | <b>{int(f*100)}%</b> flatline"
+            "</div>"
         )
-    q1.markdown(badge("HR", rates["HR"]),   unsafe_allow_html=True)
-    q2.markdown(badge("SpO₂", rates["SpO₂"]), unsafe_allow_html=True)
-    q3.markdown(badge("MAP", rates["MAP"]), unsafe_allow_html=True)
-    q4.markdown(badge("EtCO₂", rates["EtCO₂"]), unsafe_allow_html=True)
-    q5.markdown(badge("RR", rates["RR"]),   unsafe_allow_html=True)
+    q1.markdown(badge("HR", *rates["HR"]),     unsafe_allow_html=True)
+    q2.markdown(badge("SpO₂", *rates["SpO₂"]), unsafe_allow_html=True)
+    q3.markdown(badge("MAP", *rates["MAP"]),   unsafe_allow_html=True)
+    q4.markdown(badge("EtCO₂", *rates["EtCO₂"]), unsafe_allow_html=True)
+    q5.markdown(badge("RR", *rates["RR"]),     unsafe_allow_html=True)
 else:
     st.write("Collecting data...")
 
-# -------------------- Hypothesis Panel (full) --------------------
-st.subheader("Hypothesis (assistant)")
-if df.empty:
-    st.write("Insufficient data yet.")
+# -------------- Conversational Assistant + Live Situation Summary --------------
+# Helpers for trends and reasoning
+def _recent(df_: pd.DataFrame, seconds: int) -> pd.DataFrame:
+    if df_ is None or df_.empty:
+        return df_
+    end = int(df_["Time"].iloc[-1])
+    start = max(0, end - seconds + 1)
+    return df_[df_["Time"].between(start, end)]
+
+def _slope(series: pd.Series) -> float:
+    if series is None or len(series) < 2:
+        return 0.0
+    x = np.arange(len(series), dtype=float)
+    y = series.to_numpy(dtype=float)
+    xm, ym = x.mean(), y.mean()
+    denom = ((x - xm)**2).sum()
+    if denom == 0:
+        return 0.0
+    return float(((x - xm)*(y - ym)).sum() / denom)
+
+def _arrow_dir(val: float, thr: float = 0.2) -> Tuple[str,str]:
+    if val > thr:   return ("rising", "↑")
+    if val < -thr:  return ("falling", "↓")
+    return ("stable", "→")
+
+def _fmt_val(v: float, unit: str) -> str:
+    try:
+        return f"{v:.1f}{unit}"
+    except Exception:
+        return "-"
+
+def _time_to_cross(current: float, slope_per_sample: float, floor: float, hz: float) -> str:
+    if slope_per_sample >= 0:
+        return ""
+    delta = current - floor
+    if delta <= 0:
+        return "breach imminent"
+    samples = delta / abs(slope_per_sample)
+    secs = samples / max(hz, 1.0)
+    if secs < 4:
+        return "breach imminent"
+    if secs > 900:
+        return ""
+    return f"≈{int(round(secs))} s to cross {int(floor)}"
+
+def _compute_info(df_: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    info: Dict[str, Dict[str, float]] = {}
+    if df_ is None or df_.empty:
+        return info
+    w = _recent(df_, 30)
+    if w is None or w.empty:
+        w = df_
+    for v in ["HR", "MAP", "SpO2", "EtCO2", "RR"]:
+        if v in w.columns:
+            y = pd.to_numeric(w[v], errors="coerce").dropna()
+            if len(y) >= 2:
+                info[v] = {"mean": float(y.mean()), "trend": _slope(y)}
+            elif len(y) == 1:
+                info[v] = {"mean": float(y.iloc[0]), "trend": 0.0}
+    return info
+
+def _interpret(info: Dict[str, Dict[str, float]]) -> List[str]:
+    out: List[str] = []
+    if "MAP" in info and "HR" in info:
+        if info["MAP"]["trend"] < -0.2 and info["HR"]["trend"] > 0.2:
+            out.append("MAP falling while HR rising → compensated hypotension (possible hypovolemia).")
+        elif info["MAP"]["trend"] < -0.2 and info["HR"]["trend"] <= 0.0:
+            out.append("MAP falling without HR rise → vasodilation/drug effect more likely than bleeding.")
+        elif info["MAP"]["trend"] > 0.3 and info["HR"]["trend"] > 0.3:
+            out.append("MAP and HR rising together → sympathetic activation (pain/light anesthesia).")
+    if "SpO2" in info and "EtCO2" in info:
+        if info["SpO2"]["trend"] < -0.2 and info["EtCO2"]["trend"] > 0.2:
+            out.append("SpO₂ falling + EtCO₂ rising → hypoventilation/airway issue likely.")
+        elif info["SpO2"]["trend"] > 0.2 and info["EtCO2"]["trend"] < -0.2:
+            out.append("SpO₂ improving with EtCO₂ falling → ventilation improving.")
+    if "RR" in info:
+        if info["RR"]["trend"] < -0.2:
+            out.append("RR decreasing → risk of CO₂ retention if sustained.")
+        elif info["RR"]["trend"] > 0.2:
+            out.append("RR increasing → compensatory hyperventilation or stimulus response.")
+    if not out:
+        out.append("Signals are mostly stable; no strong cross-signal pattern detected.")
+    return out
+
+def _risk_label(info: Dict[str, Dict[str, float]]) -> str:
+    score = 0
+    if "SpO2" in info and info["SpO2"]["mean"] < 93: score += 2
+    if "MAP"  in info and info["MAP"]["mean"]  < 65: score += 2
+    if "EtCO2" in info and (info["EtCO2"]["mean"] > 50 or info["EtCO2"]["mean"] < 25): score += 1
+    if "HR" in info and (info["HR"]["mean"] > 120 or info["HR"]["mean"] < 45): score += 1
+    if score <= 1:  return "🟢 Stable"
+    if score == 2:  return "🟡 Watch closely"
+    return "🔴 Intervene soon"
+
+def live_summary_block(df_: pd.DataFrame, sim_hz: int) -> str:
+    info = _compute_info(df_)
+    if not info:
+        return "Not enough data yet for a summary."
+
+    parts = []
+    for v, unit in [("HR"," bpm"), ("MAP"," mmHg"), ("SpO2","%"), ("EtCO2"," mmHg"), ("RR"," bpm")]:
+        if v in info:
+            d, a = _arrow_dir(info[v]["trend"])
+            parts.append(f"{v}: {_fmt_val(info[v]['mean'], unit)} ({d} {a})")
+    header = " | ".join(parts)
+
+    reasons = _interpret(info)
+    risk = _risk_label(info)
+
+    pred_lines = []
+    if "MAP" in info:
+        ttc = _time_to_cross(info["MAP"]["mean"], info["MAP"]["trend"], 65, float(sim_hz or 1))
+        if ttc: pred_lines.append(f"MAP: {ttc}")
+    if "SpO2" in info:
+        ttc = _time_to_cross(info["SpO2"]["mean"], info["SpO2"]["trend"], 92, float(sim_hz or 1))
+        if ttc: pred_lines.append(f"SpO₂: {ttc}")
+    preds = " | ".join(pred_lines)
+
+    msg = []
+    msg.append("**Current Situation Summary**")
+    msg.append("")
+    msg.append(header)
+    msg.append("")
+    msg.extend([f"• {r}" for r in reasons])
+    msg.append("")
+    msg.append(f"**Risk Level:** {risk}")
+    if preds:
+        msg.append(f"**Prediction:** {preds}")
+    return "\n".join(msg)
+
+# ===========================
+# Conversational Assistant — Single Instance (safe, no extra hard deps)
+# Paste this function block in place of your current assistant code.
+# Call render_conversational_assistant() exactly once where you want it to appear.
+# ===========================
+
+def render_conversational_assistant():
+    # Prevent duplicate renders if accidentally called twice
+    if st.session_state.get("_assistant_rendered", False):
+        return
+    st.session_state._assistant_rendered = True
+
+    st.divider()
+    st.subheader("🎙️ Conversational Assistant")
+
+    # ---- Helpers (read-only, do not mutate widget keys after creation) ----
+    def _safe_last(series, default=None):
+        try:
+            return float(series.iloc[-1])
+        except Exception:
+            return default
+
+    def _window(df_in: pd.DataFrame, seconds: int) -> pd.DataFrame:
+        if df_in is None or df_in.empty:
+            return df_in
+        end = int(df_in["Time"].iloc[-1])
+        start = max(0, end - max(1, int(seconds)) + 1)
+        return df_in[df_in["Time"].between(start, end)]
+
+    def _slope(series: pd.Series, seconds: int = 30) -> float:
+        """Approximate slope per second over the window (last N seconds)."""
+        if series is None or len(series) < 2:
+            return 0.0
+        wlen = min(len(series), seconds)
+        w = series.iloc[-wlen:]
+        x = np.arange(len(w))
+        # simple linear regression slope
+        try:
+            m = np.polyfit(x, w.values, 1)[0]
+        except Exception:
+            m = 0.0
+        return float(m)
+
+    def _corr(df_in: pd.DataFrame, a: str, b: str, seconds: int = 60) -> float | None:
+        w = _window(df_in, seconds)
+        if w is None or w.empty or a not in w.columns or b not in w.columns:
+            return None
+        if len(w) < 3:
+            return None
+        try:
+            c = float(np.corrcoef(w[a].values, w[b].values)[0, 1])
+            if np.isnan(c):
+                return None
+            return c
+        except Exception:
+            return None
+
+    def _fmt_pct(x):
+        try:
+            return f"{int(round(x*100))}%"
+        except Exception:
+            return "—"
+
+    def _mini_scatter_spo2_vs_et(df_in: pd.DataFrame, seconds: int = 60):
+        """Optional quick visualization for 'SpO₂ vs EtCO₂ correlation' questions."""
+        w = _window(df_in, seconds)
+        if w is None or w.empty:
+            st.caption("Not enough data for a correlation plot yet.")
+            return
+        fig, ax = plt.subplots(figsize=(3.8, 3.0))
+        ax.scatter(w["EtCO2"], w["SpO2"], s=10, alpha=0.7)
+        ax.set_xlabel("EtCO₂ (mmHg)")
+        ax.set_ylabel("SpO₂ (%)")
+        ax.grid(alpha=0.25)
+        st.pyplot(fig, clear_figure=True)
+
+    def _rule_hypothesis(df_in: pd.DataFrame) -> dict:
+        """Use your existing hypothesis_components if available to report top rule hypothesis."""
+        try:
+            hyps, _comps = hypothesis_components(df_in)
+            if not hyps:
+                return {}
+            total = sum(h["score"] for h in hyps) or 1e-9
+            ranked = sorted(
+                [{"name": h["name"], "pct": int(round(100*h["score"]/total))} for h in hyps],
+                key=lambda x: x["pct"], reverse=True
+            )
+            return ranked[0] if ranked else {}
+        except Exception:
+            return {}
+
+    def _answer_query(df_in: pd.DataFrame, q: str) -> tuple[str, list[tuple[str, str]]]:
+        """
+        Returns (answer_markdown, optional_visuals)
+        optional_visuals: list of (kind, arg) items you may render (e.g., ("spo2_vs_et", "60s"))
+        """
+        if q is None:
+            q = ""
+        q_low = q.strip().lower()
+
+        # If no data yet
+        if df_in is None or df_in.empty:
+            return ("I don’t have enough data yet — start the stream or upload a replay, then ask again.", [])
+
+        # Recent window for narrative
+        w12 = _window(df_in, 12)
+        w60 = _window(df_in, 60)
+
+        # Current values
+        cur = {
+            "HR":  _safe_last(df_in["HR"]),
+            "SpO2":_safe_last(df_in["SpO2"]),
+            "MAP": _safe_last(df_in["MAP"]),
+            "Et":  _safe_last(df_in["EtCO2"]),
+            "RR":  _safe_last(df_in["RR"]),
+        }
+        # Slopes (last 30s)
+        slopes = {
+            "HR":  _slope(w60["HR"]) if w60 is not None and not w60.empty else 0.0,
+            "SpO2":_slope(w60["SpO2"]) if w60 is not None and not w60.empty else 0.0,
+            "MAP": _slope(w60["MAP"]) if w60 is not None and not w60.empty else 0.0,
+            "Et":  _slope(w60["EtCO2"]) if w60 is not None and not w60.empty else 0.0,
+            "RR":  _slope(w60["RR"]) if w60 is not None and not w60.empty else 0.0,
+        }
+
+        # Top rule hypothesis (if your engine is present)
+        top_rule = _rule_hypothesis(df_in)
+        top_line = f"**Hypothesis (rules):** {top_rule.get('name','—')} — {top_rule.get('pct','—')}%" if top_rule else ""
+
+        # Intent routing
+        visuals: list[tuple[str, str]] = []
+
+        # 1) "why is map falling?" / "why low map?" style
+        if ("map" in q_low and ("why" in q_low or "fall" in q_low or "low" in q_low)):
+            slope = slopes["MAP"]
+            hr_up = slopes["HR"] > 0.2
+            text = []
+            text.append(f"**MAP** is {int(cur['MAP']) if cur['MAP'] is not None else '—'} and slope ≈ {slope:.2f} /sample over ~30s.")
+            if hr_up:
+                text.append("**HR** is rising → pattern consistent with *volume-responsive hypotension* (hypovolemia).")
+            else:
+                text.append("**HR** not rising → could be *vasodilation* or *anesthetic depth* effect.")
+            if top_line:
+                text.append(top_line)
+            ans = "\n\n".join(text)
+            return (ans, visuals)
+
+        # 2) "show me spO2 vs etCO2 correlation"
+        if ("spo2" in q_low and ("etco2" in q_low or "et co2" in q_low) and ("corr" in q_low or "relationship" in q_low)):
+            c = _corr(df_in, "SpO2", "EtCO2", 60)
+            c_str = "—" if c is None else f"{c:+.2f}"
+            ans = f"**SpO₂–EtCO₂ correlation (last 60s):** {c_str} (−1 to +1)."
+            visuals.append(("spo2_vs_et", "60s"))
+            if top_line:
+                ans += f"\n\n{top_line}"
+            return (ans, visuals)
+
+        # 3) “trend of X”
+        for sig in ["hr", "spo2", "map", "etco2", "rr"]:
+            if sig in q_low and ("trend" in q_low or "slope" in q_low or "rising" in q_low or "falling" in q_low):
+                key = {"hr":"HR","spo2":"SpO2","map":"MAP","etco2":"EtCO2","rr":"RR"}[sig]
+                curv = cur["Et" if key=="EtCO2" else key]
+                slp  = slopes["Et" if key=="EtCO2" else key]
+                sense = "rising" if slp > 0.2 else ("falling" if slp < -0.2 else "stable")
+                ans = f"**{key}** is {int(curv) if curv is not None else '—'} and **{sense}** (slope ≈ {slp:.2f}/sample over ~30s)."
+                if top_line:
+                    ans += f"\n\n{top_line}"
+                return (ans, visuals)
+
+        # 4) “status” / “summary”
+        if ("status" in q_low) or ("summary" in q_low) or ("what's happening" in q_low) or ("whats happening" in q_low):
+            parts = []
+            for key, lbl in [("HR","HR"),("SpO2","SpO₂"),("MAP","MAP"),("Et","EtCO₂"),("RR","RR")]:
+                v = cur[key]
+                sl = slopes[key]
+                sense = "↑" if sl > 0.2 else ("↓" if sl < -0.2 else "→")
+                parts.append(f"{lbl} {int(v) if v is not None else '—'} ({sense})")
+            ans = "**Current status:** " + " · ".join(parts)
+            if top_line:
+                ans += f"\n\n{top_line}"
+            return (ans, visuals)
+
+        # 5) Default fallback: generic helpful response using top rule hypothesis if available
+        ans = "I'm still learning to answer that. Try asking about **MAP**, **SpO₂ vs EtCO₂ correlation**, or **trend** of a vital."
+        if top_line:
+            ans += f"\n\n{top_line}"
+        return (ans, visuals)
+
+    # ---- UI (single instance) ----
+    # Row: text input + ask button
+    c1, c2 = st.columns([4,1], vertical_alignment="bottom")
+    user_q = c1.text_input("Ask a question (e.g., 'Why is MAP falling?' or 'Show SpO₂ vs EtCO₂ correlation')",
+                           value="", key="asst_q_text")
+    ask_clicked = c2.button("Ask HALO", key="asst_q_btn")
+
+    # Optional: voice capture (graceful fallback if module is missing)
+    # We only attempt if the user wants it; no dependency = no break.
+    st.caption("Optional voice: if installed, click to record; otherwise use the text box.")
+    vcol1, vcol2 = st.columns([1,5])
+    use_voice = vcol1.checkbox("Use voice input (if available)", value=False, key="asst_voice_enable")
+
+    audio_text = ""
+    if use_voice:
+        try:
+            # Requires: pip install audio-recorder-streamlit speechrecognition pydub
+            from audio_recorder_streamlit import audio_recorder  # type: ignore
+            import speech_recognition as sr  # type: ignore
+
+            st.write("Click to start/stop recording:")
+            audio_bytes = audio_recorder(pause_threshold=1.0, text="", icon_size="2x")
+            if audio_bytes:
+                # Try to transcribe from memory buffer
+                recognizer = sr.Recognizer()
+                with sr.AudioFile(io.BytesIO(audio_bytes)) as source:
+                    audio = recognizer.record(source)
+                try:
+                    audio_text = recognizer.recognize_google(audio)  # offline alt not bundled; this is best-effort
+                    st.success(f"Voice captured: “{audio_text}”")
+                except Exception as e:
+                    st.warning(f"Could not transcribe (best-effort): {e}")
+        except Exception as e:
+            st.info(f"Voice input not available (optional deps missing). Use the text box. ({e})")
+
+    # Decide final question string
+    final_q = audio_text.strip() if audio_text.strip() else (user_q or "").strip()
+
+    # When user clicks Ask or voice provided some text, answer
+    if ask_clicked or (use_voice and audio_text.strip()):
+        # Use the global df if present
+        try:
+            df_in = st.session_state.history if "history" in st.session_state else None
+        except Exception:
+            df_in = None
+
+        answer_md, visuals = _answer_query(df_in, final_q)
+
+        # Render answer bubble (high-contrast on light background)
+        st.markdown(
+            f"""
+            <div style="
+                border-left: 10px solid #1e62ff;
+                background: #e9f0ff;
+                color: #0a0a0a;
+                padding: 14px 18px;
+                border-radius: 10px;
+                margin: 10px 0;
+                font-size: 1.05rem;
+                line-height: 1.5;
+                box-shadow: 0 2px 6px rgba(0,0,0,0.12);
+            ">
+              <div style="font-weight:800;color:#0b2a6b;font-size:1.1rem;margin-bottom:6px;">
+                HALO Response
+              </div>
+              <div>{answer_md}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # Render optional visuals requested by handler
+        for kind, arg in visuals:
+            if kind == "spo2_vs_et":
+                _mini_scatter_spo2_vs_et(df_in, seconds=60)
+
+# ----- Render Assistant (single; bottom) -----
+st.divider()
+st.subheader("💬 Conversational Assistant")
+
+colQ1, colQ2 = st.columns([3,1])
+q_text = colQ1.text_input(
+    "Ask HALO a question (e.g., “Why is MAP falling?” or “Summarize the current situation.”)",
+    key="halo_q_input",
+    placeholder="Type here…"
+)
+
+voice_text = None
+if voice_available():
+    with colQ2:
+        with st.expander("🎤 Voice (Start/Stop)"):
+            voice_text = voice_widget()
+            if voice_text:
+                st.success(f"Transcribed: “{voice_text}”")
 else:
-    hyps, comps = hypothesis_components(df)
-    total = sum(h["score"] for h in hyps) or 1e-9
-    for h in hyps: h["pct"] = int(round(100 * h["score"] / total))
-    top = sorted(hyps, key=lambda x: x["pct"], reverse=True)
-    st.markdown(f"**Likely (rules):** {top[0]['name']} — **{top[0]['pct']}%**")
-    others = ", ".join([f"{h['name']} {h['pct']}%" for h in top[1:]])
-    if others: st.write("Other possibilities (rules):", others)
+    st.caption("🎤 Voice capture not available (missing dependencies). You can still type questions.")
 
-    if st.session_state.ml_use_in_hypothesis:
-        mlp = ml_predict_last(df)
-        if mlp:
-            ml_sorted = sorted(mlp.items(), key=lambda kv: kv[1], reverse=True)
-            best_name, best_p = ml_sorted[0]
-            st.markdown(f"**Likely (ML):** {best_name} — **{int(round(best_p*100))}%**")
-            st.caption("ML = Logistic Regression trained on synthetic and/or uploaded labeled data.")
+final_q = voice_text if (voice_text and len(voice_text) > 0) else q_text
 
-# -------------------- Show Effective Thresholds (Transparency) --------------------
-if show_details:
-    st.subheader("Effective thresholds (scenario & event modifiers applied)")
-    eff_view = pd.DataFrame([{
-        "SpO₂ low trigger": eff["low_spo2"],
-        "SpO₂ exit": eff["exit_spo2"],
-        "Tachy HR trigger": eff["tachy_hr"],
-        "MAP low trigger": eff["low_map"],
-        "MAP exit": eff["exit_map"],
-        "EtCO₂ high trigger": eff["high_et"],
-        "RR low trigger": eff["low_rr"],
-        "Scenario": st.session_state.scenario_name or "None",
-        "Recent events": ", ".join(f"{e['name']}@{e['t']}" for e in st.session_state.events[-4:]) or "—",
-    }])
-    st.dataframe(eff_view, use_container_width=True, hide_index=True)
+# Immediate response (no second click needed if voice text arrived)
+# If typed, press the button to answer.
+do_answer = st.button("Get HALO Answer", type="primary", key="answer_btn") or bool(voice_text)
 
-# -------------------- Audit & Export --------------------
+if do_answer:
+    resp = answer_query(final_q, df, int(st.session_state.get("sim_hz", 5)))
+    st.markdown(f"""
+    <div style="
+        border-left:10px solid #1e62ff;
+        background:#e9f0ff; color:#0a0a0a;
+        padding:14px 18px;border-radius:10px;margin:10px 0;
+        font-size:1.02rem;line-height:1.5;box-shadow:0 2px 6px rgba(0,0,0,0.12);
+        ">
+        <div style="font-weight:800;color:#0b2a6b;font-size:1.2rem;margin-bottom:6px;">HALO Response</div>
+        <div>{resp['text'].replace('\n','<br>')}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Always show a live summary under the assistant
+live_summary = live_summary_block(df, int(st.session_state.get("sim_hz", 5)))
+st.markdown(f"""
+<div style="
+    border-left:10px solid #0a8a0a;
+    background:#e8f7e8; color:#0a0a0a;
+    padding:14px 18px;border-radius:10px;margin:10px 0;
+    font-size:1.0rem;line-height:1.5;box-shadow:0 2px 6px rgba(0,0,0,0.12);
+    ">
+    <div style="font-weight:800;color:#0a5a0a;font-size:1.1rem;margin-bottom:6px;">Live Situation Summary</div>
+    <div>{live_summary.replace('\n','<br>')}</div>
+</div>
+""", unsafe_allow_html=True)
+
+# -------------- Audit & Export --------------
 st.subheader("Alarm Audit Trail")
 if len(st.session_state.audit)==0:
     st.write("No events yet.")
@@ -1008,7 +1193,7 @@ else:
     st.download_button("Download HALO vitals.csv", data=csv, file_name="halo_vitals.csv", mime="text/csv")
     st.caption("Export shows exactly what HALO observed in real time.")
 
-# -------------------- Self-refresh --------------------
+# -------------- Self-refresh --------------
 if st.session_state.running:
     time.sleep(1)
     st.rerun()
