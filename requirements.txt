@@ -8,3 +8,7 @@ SpeechRecognition==3.10.4
 pydub==0.25.1
 webrtcvad==2.0.10
 av==12.3.0
+streamlit-webrtc==0.47.6
+av==12.3.0
+vosk==0.3.44
+pydub==0.25.1
