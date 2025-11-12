@@ -80,6 +80,101 @@ def _resolve_cols(df: pd.DataFrame) -> dict:
         "EtCO2":pick(["EtCO2","EtCO₂","etco2","ETCO2","ETCO₂"]),
         "RR":   pick(["RR","Resp Rate","Respiration","resp_rate","rr"]),
     }
+# --- 🩺 Live Situation Summary (v4.0 compatible) ---
+import numpy as np
+
+def live_summary(df):
+    """Generate a multi-signal situational summary from recent data."""
+    try:
+        window = df.tail(90)
+        slopes = {}
+
+        for col in ["MAP", "HR", "SpO₂", "EtCO₂", "RR"]:
+            if col in window.columns:
+                vals = window[col].values
+                if len(vals) > 1:
+                    slopes[col] = (vals[-1] - vals[0]) / len(vals)
+                else:
+                    slopes[col] = 0.0
+
+        summary = []
+
+        # --- MAP ---
+        if "MAP" in slopes:
+            if slopes["MAP"] < -0.3:
+                summary.append("MAP falling — possible hypoperfusion.")
+            elif slopes["MAP"] > 0.3:
+                summary.append("MAP rising — possible pressor response or recovery.")
+            else:
+                summary.append("MAP stable.")
+
+        # --- HR ---
+        if "HR" in slopes:
+            if slopes["HR"] > 0.3:
+                summary.append("HR increasing — possible pain, stress, or compensation.")
+            elif slopes["HR"] < -0.3:
+                summary.append("HR decreasing — possible deep anesthesia or drug effect.")
+            else:
+                summary.append("HR stable.")
+
+        # --- SpO₂ ---
+        if "SpO₂" in slopes:
+            if slopes["SpO₂"] < -0.2:
+                summary.append("SpO₂ trending down — check airway or oxygenation.")
+            elif slopes["SpO₂"] > 0.2:
+                summary.append("SpO₂ improving.")
+            else:
+                summary.append("SpO₂ stable.")
+
+        # --- EtCO₂ ---
+        if "EtCO₂" in slopes:
+            if slopes["EtCO₂"] < -0.3:
+                summary.append("EtCO₂ falling — hyperventilation or perfusion drop.")
+            elif slopes["EtCO₂"] > 0.3:
+                summary.append("EtCO₂ rising — hypoventilation or CO₂ retention.")
+            else:
+                summary.append("EtCO₂ stable.")
+
+        # --- RR ---
+        if "RR" in slopes:
+            if slopes["RR"] > 0.3:
+                summary.append("RR rising — compensatory hyperventilation.")
+            elif slopes["RR"] < -0.3:
+                summary.append("RR decreasing — sedation or airway depression.")
+            else:
+                summary.append("RR stable.")
+
+        summary_text = " · ".join(summary)
+
+        # --- Style output ---
+        st.markdown(
+            f"""
+            <div style="
+                background-color:#eef3ff;
+                border-left:6px solid #1e62ff;
+                padding:12px 14px;
+                border-radius:10px;
+                box-shadow:0 1px 4px rgba(0,0,0,0.1);
+                margin-top:16px;
+                margin-bottom:20px;
+            ">
+                <h4 style="color:#0b2a6b; margin-bottom:8px;">
+                    🧩 Live Situation Summary
+                </h4>
+                <p style="color:#0a0a0a; font-size:0.95rem; line-height:1.5;">
+                    {summary_text}
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    except Exception as e:
+        st.warning(f"Unable to generate live summary: {e}")
+
+# --- Example placement ---
+if "df" in locals() or "df" in globals():
+    live_summary(df)
 
 # --- Conversational Output Formatter (Short Paragraph Version, robust) ---
 def answer_query(q: str, df: pd.DataFrame, sim_hz: int = 5):
@@ -530,13 +625,97 @@ st.session_state["df"] = df  # expose for assistant safely
 # -------------- Vitals Charts (top) --------------
 c1, c2, c3, c4, c5 = st.columns(5)
 if not df.empty:
-    c1.subheader("HR (bpm)");     c1.line_chart(df.set_index("Time")["HR"], use_container_width=True)
-    c2.subheader("SpO₂ (%)");     c2.line_chart(df.set_index("Time")["SpO2"], use_container_width=True)
-    c3.subheader("MAP (mmHg)");   c3.line_chart(df.set_index("Time")["MAP"], use_container_width=True)
-    c4.subheader("EtCO₂ (mmHg)"); c4.line_chart(df.set_index("Time")["EtCO2"], use_container_width=True)
-    c5.subheader("RR (bpm)");     c5.line_chart(df.set_index("Time")["RR"], use_container_width=True)
+    c1.subheader("HR (bpm)")
+    c1.line_chart(df.set_index("Time")["HR"], use_container_width=True)
+    c2.subheader("SpO₂ (%)")
+    c2.line_chart(df.set_index("Time")["SpO2"], use_container_width=True)
+    c3.subheader("MAP (mmHg)")
+    c3.line_chart(df.set_index("Time")["MAP"], use_container_width=True)
+    c4.subheader("EtCO₂ (mmHg)")
+    c4.line_chart(df.set_index("Time")["EtCO2"], use_container_width=True)
+    c5.subheader("RR (bpm)")
+    c5.line_chart(df.set_index("Time")["RR"], use_container_width=True)
 else:
     st.info("Click Start (Live) or upload a CSV (Replay).")
+
+# --- 🧩 Live Situation Summary (real-time block) ---
+def live_summary_block(df_: pd.DataFrame):
+    if df_ is None or df_.empty:
+        st.info("Collecting data…")
+        return
+    window = df_.tail(90)
+    slopes, summary = {}, []
+
+    for col in ["MAP", "HR", "SpO2", "EtCO2", "RR"]:
+        if col in window.columns:
+            vals = window[col].values
+            slopes[col] = (vals[-1] - vals[0]) / max(len(vals), 1)
+
+    # Quick interpretive summary
+    if slopes.get("MAP", 0) < -0.3:
+        summary.append("MAP falling — possible hypoperfusion.")
+    elif slopes.get("MAP", 0) > 0.3:
+        summary.append("MAP rising — possible pressor response.")
+    else:
+        summary.append("MAP stable.")
+
+    if slopes.get("HR", 0) > 0.3:
+        summary.append("HR rising — possible pain, stress, or compensation.")
+    elif slopes.get("HR", 0) < -0.3:
+        summary.append("HR falling — drug or deep anesthesia effect.")
+    else:
+        summary.append("HR stable.")
+
+    if slopes.get("SpO2", 0) < -0.2:
+        summary.append("SpO₂ dropping — check airway/oxygenation.")
+    elif slopes.get("SpO2", 0) > 0.2:
+        summary.append("SpO₂ improving.")
+    else:
+        summary.append("SpO₂ stable.")
+
+    if slopes.get("EtCO2", 0) < -0.3:
+        summary.append("EtCO₂ falling — hyperventilation or perfusion drop.")
+    elif slopes.get("EtCO2", 0) > 0.3:
+        summary.append("EtCO₂ rising — hypoventilation or CO₂ retention.")
+    else:
+        summary.append("EtCO₂ stable.")
+
+    if slopes.get("RR", 0) > 0.3:
+        summary.append("RR rising — compensatory hyperventilation.")
+    elif slopes.get("RR", 0) < -0.3:
+        summary.append("RR falling — sedation or airway depression.")
+    else:
+        summary.append("RR stable.")
+
+    summary_text = " · ".join(summary)
+    st.markdown(
+        f"""
+        <div style="
+            background-color:#eef3ff;
+            border-left:6px solid #1e62ff;
+            padding:12px 14px;
+            border-radius:10px;
+            box-shadow:0 1px 4px rgba(0,0,0,0.1);
+            margin-top:16px;
+            margin-bottom:20px;
+        ">
+            <h4 style="color:#0b2a6b;margin-bottom:8px;">
+                🧩 Live Situation Summary
+            </h4>
+            <p style="color:#0a0a0a;font-size:0.95rem;line-height:1.5;">
+                {summary_text}
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# Render live summary if data present
+if not df.empty:
+    live_summary_block(df)
+
+# -------------- Helpers for alarms & summary --------------
+
 
 # -------------- Helpers for alarms & summary --------------
 def last_n(df_: pd.DataFrame, seconds: int) -> pd.DataFrame:
