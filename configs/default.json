@@ -1,0 +1,12 @@
+{
+  "runtime": {
+    "seed": 7,
+    "mode": "research"
+  },
+  "data": {
+    "source": "vitaldb",
+    "subset_case_ids": [1, 2, 3],
+    "resample_hz": 1,
+    "cache_dir": "artifacts/cache"
+  }
+}
