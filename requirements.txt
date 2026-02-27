@@ -5,3 +5,4 @@ matplotlib
 altair
 audio-recorder-streamlit
 SpeechRecognition
+pytest
